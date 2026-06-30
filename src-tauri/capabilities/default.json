@@ -1,0 +1,32 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for the main window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-available-monitors",
+    "core:window:allow-outer-position",
+    "core:window:allow-outer-size",
+    "core:window:allow-set-position",
+    "core:window:allow-start-dragging",
+    "opener:default",
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        {
+          "name": "codex-app-server",
+          "cmd": "codex",
+          "args": ["app-server"]
+        },
+        {
+          "name": "codex-app-server-nvm",
+          "cmd": "$HOME/.nvm/versions/node/v20.19.0/bin/codex",
+          "args": ["app-server"]
+        }
+      ]
+    },
+    "shell:allow-stdin-write",
+    "shell:allow-kill"
+  ]
+}

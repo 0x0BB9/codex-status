@@ -1,0 +1,1628 @@
+import {
+  startTransition,
+  useDeferredValue,
+  useEffect,
+  useEffectEvent,
+  useRef,
+  useState,
+} from "react";
+import {
+  availableMonitors,
+  getCurrentWindow,
+  PhysicalPosition,
+} from "@tauri-apps/api/window";
+import type { PlanType, ServerNotification } from "./generated";
+import type {
+  Account,
+  GetAccountRateLimitsResponse,
+  RateLimitSnapshot,
+  Thread,
+} from "./generated/v2";
+import { CodexAppServerClient, DEFAULT_CODEX_WS_URL } from "./lib/codex-app-server";
+import {
+  listLocalCodexAccounts,
+  saveCurrentCodexAccount,
+  switchLocalCodexAccount,
+  type StoredCodexRegistry,
+} from "./lib/local-codex-accounts";
+import {
+  EMPTY_THREAD_BOARD_METADATA,
+  listThreadBoardMetadata,
+  setThreadBoardMetadata,
+  type ThreadBoardMetadata,
+  type ThreadBoardState,
+  type ThreadPriority,
+  type ThreadStage,
+} from "./lib/thread-board";
+import {
+  CodexAppServerShellClient,
+  isTauriRuntime,
+} from "./lib/tauri-shell";
+import "./App.css";
+
+type ConnectionState = "disconnected" | "connecting" | "connected" | "error";
+type ThreadFilter = "all" | "recent" | "idle" | "systemError";
+type ThreadGroupBy = "none" | "project" | "priority" | "stage";
+type DashboardClient = {
+  connect: (target: string) => Promise<unknown>;
+  disconnect: (reason?: string) => void;
+  getAccount: () => Promise<{ account: Account | null }>;
+  getRateLimits: () => Promise<GetAccountRateLimitsResponse>;
+  isConnected: () => boolean;
+  listThreads: (params: {
+    limit: number;
+    sortDirection: "desc";
+    sortKey: "updated_at";
+  }) => Promise<{ data: Thread[] }>;
+};
+
+const MAX_LOG_LINES = 6;
+const PLAN_TYPE_LABELS: Record<PlanType, string> = {
+  free: "免费版",
+  go: "Go",
+  plus: "Plus",
+  pro: "Pro",
+  prolite: "Pro Lite",
+  team: "Team",
+  self_serve_business_usage_based: "Business 按量版",
+  business: "Business",
+  enterprise_cbp_usage_based: "Enterprise 按量版",
+  enterprise: "Enterprise",
+  edu: "教育版",
+  unknown: "未知套餐",
+};
+const THREAD_FILTER_LABELS: Record<ThreadFilter, string> = {
+  all: "全部",
+  recent: "最近活跃",
+  idle: "空闲",
+  systemError: "异常",
+};
+const THREAD_GROUP_LABELS: Record<ThreadGroupBy, string> = {
+  none: "不分组",
+  project: "按项目",
+  priority: "按优先级",
+  stage: "按阶段",
+};
+const PRIORITY_LABELS: Record<ThreadPriority, string> = {
+  none: "未设优先级",
+  high: "高优先级",
+  medium: "中优先级",
+  low: "低优先级",
+};
+const STAGE_LABELS: Record<ThreadStage, string> = {
+  none: "未设阶段",
+  todo: "待处理",
+  doing: "进行中",
+  waiting: "等待中",
+  done: "已完成",
+};
+const PRIORITY_ORDER: ThreadPriority[] = ["high", "medium", "low", "none"];
+const STAGE_ORDER: ThreadStage[] = ["todo", "doing", "waiting", "done", "none"];
+const RECENT_THREAD_ACTIVITY_SECONDS = 10 * 60;
+const SNAP_EDGE_DISTANCE = 28;
+const SNAP_SETTLE_DELAY_MS = 160;
+
+type AppWindow = ReturnType<typeof getCurrentWindow>;
+type MonitorInfo = Awaited<ReturnType<typeof availableMonitors>>[number];
+
+function formatPlanType(planType: PlanType | null | undefined) {
+  if (!planType) {
+    return "未知套餐";
+  }
+
+  return PLAN_TYPE_LABELS[planType] ?? planType;
+}
+
+function formatPercent(value: number | null | undefined) {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return "暂无";
+  }
+
+  return `${Math.round(value)}%`;
+}
+
+function getUsageTone(value: number | null | undefined) {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return "unknown";
+  }
+
+  if (value >= 90) {
+    return "danger";
+  }
+
+  if (value >= 70) {
+    return "warning";
+  }
+
+  return "safe";
+}
+
+function getUsageToneText(value: number | null | undefined) {
+  switch (getUsageTone(value)) {
+    case "danger":
+      return "五小时用量紧张";
+    case "warning":
+      return "五小时用量偏高";
+    case "safe":
+      return "五小时用量正常";
+    default:
+      return "五小时用量未知";
+  }
+}
+
+function clamp(value: number, min: number, max: number) {
+  if (max < min) {
+    return min;
+  }
+
+  return Math.min(Math.max(value, min), max);
+}
+
+function getNearestMonitor(
+  position: PhysicalPosition,
+  width: number,
+  height: number,
+  monitors: MonitorInfo[],
+) {
+  const centerX = position.x + width / 2;
+  const centerY = position.y + height / 2;
+
+  return monitors.reduce<MonitorInfo | null>((nearest, monitor) => {
+    if (!nearest) {
+      return monitor;
+    }
+
+    const monitorCenterX = monitor.workArea.position.x + monitor.workArea.size.width / 2;
+    const monitorCenterY = monitor.workArea.position.y + monitor.workArea.size.height / 2;
+    const nearestCenterX = nearest.workArea.position.x + nearest.workArea.size.width / 2;
+    const nearestCenterY = nearest.workArea.position.y + nearest.workArea.size.height / 2;
+    const monitorDistance =
+      (centerX - monitorCenterX) ** 2 + (centerY - monitorCenterY) ** 2;
+    const nearestDistance =
+      (centerX - nearestCenterX) ** 2 + (centerY - nearestCenterY) ** 2;
+
+    return monitorDistance < nearestDistance ? monitor : nearest;
+  }, null);
+}
+
+async function snapWindowToScreenEdge(appWindow: AppWindow) {
+  const [position, size, monitors] = await Promise.all([
+    appWindow.outerPosition(),
+    appWindow.outerSize(),
+    availableMonitors(),
+  ]);
+  const monitor = getNearestMonitor(position, size.width, size.height, monitors);
+
+  if (!monitor) {
+    return;
+  }
+
+  const minX = monitor.workArea.position.x;
+  const minY = monitor.workArea.position.y;
+  const maxX = minX + monitor.workArea.size.width - size.width;
+  const maxY = minY + monitor.workArea.size.height - size.height;
+  const rightEdge = minX + monitor.workArea.size.width;
+  const bottomEdge = minY + monitor.workArea.size.height;
+  let nextX = clamp(position.x, minX, maxX);
+  let nextY = clamp(position.y, minY, maxY);
+
+  if (Math.abs(position.x - minX) <= SNAP_EDGE_DISTANCE) {
+    nextX = minX;
+  } else if (Math.abs(position.x + size.width - rightEdge) <= SNAP_EDGE_DISTANCE) {
+    nextX = maxX;
+  }
+
+  if (Math.abs(position.y - minY) <= SNAP_EDGE_DISTANCE) {
+    nextY = minY;
+  } else if (Math.abs(position.y + size.height - bottomEdge) <= SNAP_EDGE_DISTANCE) {
+    nextY = maxY;
+  }
+
+  nextX = Math.round(nextX);
+  nextY = Math.round(nextY);
+
+  if (nextX !== position.x || nextY !== position.y) {
+    await appWindow.setPosition(new PhysicalPosition(nextX, nextY));
+  }
+}
+
+function formatRelativeTime(timestampSeconds: number) {
+  const formatter = new Intl.RelativeTimeFormat("zh-CN", { numeric: "auto" });
+  const diffSeconds = Math.round(timestampSeconds - Date.now() / 1000);
+
+  if (Math.abs(diffSeconds) < 60) {
+    return formatter.format(diffSeconds, "second");
+  }
+
+  const diffMinutes = Math.round(diffSeconds / 60);
+  if (Math.abs(diffMinutes) < 60) {
+    return formatter.format(diffMinutes, "minute");
+  }
+
+  const diffHours = Math.round(diffMinutes / 60);
+  if (Math.abs(diffHours) < 24) {
+    return formatter.format(diffHours, "hour");
+  }
+
+  return formatter.format(Math.round(diffHours / 24), "day");
+}
+
+function formatResetTime(unixSeconds: number | null | undefined) {
+  if (!unixSeconds) {
+    return "暂无重置时间";
+  }
+
+  return new Intl.DateTimeFormat("zh-CN", {
+    hour: "numeric",
+    minute: "2-digit",
+    month: "short",
+    day: "numeric",
+  }).format(unixSeconds * 1000);
+}
+
+function formatRateLimitWindowLabel(
+  window: { windowDurationMins: number | null } | null | undefined,
+  fallback: string,
+) {
+  const durationMins = window?.windowDurationMins;
+  if (!durationMins) {
+    return fallback;
+  }
+
+  if (durationMins === 300) {
+    return "五小时使用量";
+  }
+
+  if (durationMins === 10_080) {
+    return "一周使用量";
+  }
+
+  if (durationMins % 10_080 === 0) {
+    return `${durationMins / 10_080} 周使用量`;
+  }
+
+  if (durationMins % 1_440 === 0) {
+    return `${durationMins / 1_440} 天使用量`;
+  }
+
+  if (durationMins % 60 === 0) {
+    return `${durationMins / 60} 小时使用量`;
+  }
+
+  return `${durationMins} 分钟使用量`;
+}
+
+function shortenPath(path: string) {
+  const segments = path.split("/").filter(Boolean);
+  return segments.slice(-2).join("/") || path;
+}
+
+function getThreadLabel(thread: Thread) {
+  return thread.name?.trim() || thread.preview?.trim() || "未命名任务";
+}
+
+function isRecentlyUpdatedThread(thread: Thread) {
+  const ageSeconds = Date.now() / 1000 - thread.updatedAt;
+  return ageSeconds >= 0 && ageSeconds <= RECENT_THREAD_ACTIVITY_SECONDS;
+}
+
+function getThreadStatusTone(thread: Thread) {
+  const { status } = thread;
+
+  switch (status.type) {
+    case "active":
+      if (status.activeFlags.includes("waitingOnApproval")) {
+        return "approval";
+      }
+
+      if (status.activeFlags.includes("waitingOnUserInput")) {
+        return "input";
+      }
+
+      return "active";
+    case "systemError":
+      return "error";
+    default:
+      return isRecentlyUpdatedThread(thread) ? "recent" : status.type === "idle" ? "idle" : "not-loaded";
+  }
+}
+
+function getThreadStatusText(thread: Thread) {
+  const { status } = thread;
+
+  switch (status.type) {
+    case "active":
+      if (status.activeFlags.includes("waitingOnApproval")) {
+        return "等待审批";
+      }
+
+      if (status.activeFlags.includes("waitingOnUserInput")) {
+        return "等待输入";
+      }
+
+      return "进行中";
+    case "systemError":
+      return "系统异常";
+    case "idle":
+      return isRecentlyUpdatedThread(thread) ? "最近活跃" : "空闲";
+    case "notLoaded":
+      return isRecentlyUpdatedThread(thread) ? "最近活跃" : "未加载";
+    default:
+      return "未知";
+  }
+}
+
+function getThreadFilterKey(thread: Thread): ThreadFilter {
+  if (thread.status.type === "systemError") {
+    return "systemError";
+  }
+
+  if (thread.status.type === "active" || isRecentlyUpdatedThread(thread)) {
+    return "recent";
+  }
+
+  return "idle";
+}
+
+function mergeRateLimitSnapshot(
+  current: RateLimitSnapshot | null,
+  incoming: RateLimitSnapshot,
+) {
+  if (!current) {
+    return incoming;
+  }
+
+  return {
+    limitId: incoming.limitId ?? current.limitId,
+    limitName: incoming.limitName ?? current.limitName,
+    primary: incoming.primary ?? current.primary,
+    secondary: incoming.secondary ?? current.secondary,
+    credits: incoming.credits ?? current.credits,
+    individualLimit: incoming.individualLimit ?? current.individualLimit,
+    planType: incoming.planType ?? current.planType,
+    rateLimitReachedType:
+      incoming.rateLimitReachedType ?? current.rateLimitReachedType,
+  };
+}
+
+function normalizeRateLimits(payload: GetAccountRateLimitsResponse) {
+  const entries = Object.entries(payload.rateLimitsByLimitId ?? {});
+  if (entries.length === 0) {
+    return [payload.rateLimits];
+  }
+
+  return entries
+    .map(([, snapshot]) => snapshot)
+    .filter((snapshot): snapshot is RateLimitSnapshot => Boolean(snapshot));
+}
+
+function describeAccount(account: Account | null) {
+  if (!account) {
+    return "未登录";
+  }
+
+  switch (account.type) {
+    case "chatgpt":
+      return `${account.email} · ${formatPlanType(account.planType)}`;
+    case "apiKey":
+      return "API Key 模式";
+    case "amazonBedrock":
+      return "Amazon Bedrock";
+    default:
+      return "已连接";
+  }
+}
+
+function formatEventName(method: string) {
+  switch (method) {
+    case "account/updated":
+      return "账号已更新";
+    case "account/rateLimits/updated":
+      return "用量已更新";
+    case "account/switched":
+      return "账号已切换";
+    case "account/saved":
+      return "当前账号已保存";
+    case "thread/status/changed":
+      return "任务状态已更新";
+    case "thread/started":
+      return "任务已启动";
+    case "thread/archived":
+      return "任务已归档";
+    case "thread/unarchived":
+      return "任务已恢复";
+    case "thread/name/updated":
+      return "任务名称已更新";
+    case "thread/goal/updated":
+      return "目标已更新";
+    case "thread/goal/cleared":
+      return "目标已清除";
+    default:
+      return method;
+  }
+}
+
+function formatConnectionError(message: string | null) {
+  if (!message) {
+    return null;
+  }
+
+  if (message.includes("timed out waiting for Codex app-server")) {
+    return "等待 Codex app-server 响应超时。";
+  }
+
+  if (message.startsWith("Unable to start codex app-server.")) {
+    return "无法启动 codex app-server。请确认 Codex CLI 可用，详情见下方日志。";
+  }
+
+  switch (message) {
+    case "Unable to connect to Codex app-server.":
+      return "无法连接到 Codex app-server。";
+    case "Timed out while connecting to Codex app-server.":
+      return "连接 Codex app-server 超时。";
+    case "WebSocket refused the connection.":
+      return "WebSocket 连接被拒绝。";
+    case "Codex app-server encountered a websocket error.":
+      return "Codex app-server 的 WebSocket 连接异常。";
+    case "Codex app-server exited.":
+      return "Codex app-server 已退出。";
+    case "Codex app-server is not running.":
+    case "Not connected to Codex app-server.":
+      return "Codex app-server 未运行。";
+    case "The stdio transport is only available inside Tauri.":
+      return "stdio 连接只能在 Tauri 客户端内使用。";
+    case "Disconnected":
+      return "已断开连接。";
+    case "Reconnecting":
+      return "正在重连。";
+    default:
+      return message;
+  }
+}
+
+function getErrorMessage(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback;
+}
+
+function formatLocalAccountError(error: unknown, fallback: string) {
+  const message = getErrorMessage(error, fallback);
+
+  if (message.includes("Current ~/.codex/auth.json")) {
+    return "当前 ~/.codex/auth.json 里没有可保存的 ChatGPT 登录状态或 API Key。";
+  }
+
+  if (message.includes("Saved auth snapshot is missing")) {
+    return "目标账号的本地认证快照不存在，无法切换。";
+  }
+
+  if (message.includes("Account is not saved in the local registry")) {
+    return "账号列表中找不到这个账号，请刷新账号列表后重试。";
+  }
+
+  if (message.includes("Unable to read") || message.includes("Unable to parse")) {
+    return `本地 Codex 账号文件读取失败：${message}`;
+  }
+
+  return message;
+}
+
+function formatRateLimitError(message: string | null) {
+  if (!message) {
+    return null;
+  }
+
+  if (
+    message.includes("failed to fetch codex rate limits") ||
+    message.includes("/backend-api/wham/usage")
+  ) {
+    return "用量接口暂不可用，不影响账号和任务状态。可能是当前账号、网络或 Codex 服务端限制。";
+  }
+
+  if (message.includes("account/rateLimits/read timed out")) {
+    return "读取用量超时，不影响账号和任务状态。";
+  }
+
+  return `用量暂不可用：${message}`;
+}
+
+function formatAuthPlan(plan: string | null | undefined) {
+  if (!plan) {
+    return "未知套餐";
+  }
+
+  return PLAN_TYPE_LABELS[plan as PlanType] ?? plan;
+}
+
+function formatUnixTime(unixSeconds: number | null | undefined) {
+  if (!unixSeconds) {
+    return "暂无使用记录";
+  }
+
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(unixSeconds * 1000);
+}
+
+function getAuthAccountTitle(account: StoredCodexRegistry["accounts"][number]) {
+  return (
+    account.alias?.trim() ||
+    account.account_name?.trim() ||
+    account.email?.trim() ||
+    "未命名账号"
+  );
+}
+
+function normalizeBoardText(value: string | null | undefined) {
+  return value?.trim() ?? "";
+}
+
+function normalizeThreadBoardMetadata(metadata: ThreadBoardMetadata) {
+  return {
+    pinned: Boolean(metadata.pinned),
+    note: normalizeBoardText(metadata.note),
+    project: normalizeBoardText(metadata.project),
+    priority: metadata.priority ?? "none",
+    stage: metadata.stage ?? "none",
+    updatedAtMs: metadata.updatedAtMs ?? null,
+  } satisfies ThreadBoardMetadata;
+}
+
+function getThreadBoardMetadata(
+  boardState: ThreadBoardState,
+  threadId: string,
+) {
+  return normalizeThreadBoardMetadata({
+    ...EMPTY_THREAD_BOARD_METADATA,
+    ...(boardState.threads[threadId] ?? {}),
+  });
+}
+
+function getBoardChips(metadata: ThreadBoardMetadata) {
+  const chips: Array<{ className: string; label: string }> = [];
+
+  if (metadata.pinned) {
+    chips.push({ className: "board-chip pinned", label: "关注" });
+  }
+
+  if (metadata.project) {
+    chips.push({ className: "board-chip project", label: `项目 ${metadata.project}` });
+  }
+
+  if (metadata.priority && metadata.priority !== "none") {
+    chips.push({
+      className: `board-chip priority-${metadata.priority}`,
+      label: PRIORITY_LABELS[metadata.priority],
+    });
+  }
+
+  if (metadata.stage && metadata.stage !== "none") {
+    chips.push({
+      className: `board-chip stage-${metadata.stage}`,
+      label: STAGE_LABELS[metadata.stage],
+    });
+  }
+
+  return chips;
+}
+
+function hasBoardDetails(metadata: ThreadBoardMetadata) {
+  return getBoardChips(metadata).length > 0 || Boolean(metadata.note);
+}
+
+function isEmptyBoardMetadata(metadata: ThreadBoardMetadata) {
+  return (
+    !metadata.pinned &&
+    !metadata.note &&
+    !metadata.project &&
+    (!metadata.priority || metadata.priority === "none") &&
+    (!metadata.stage || metadata.stage === "none")
+  );
+}
+
+function mergeThreadBoardState(
+  state: ThreadBoardState,
+  threadId: string,
+  metadata: ThreadBoardMetadata,
+) {
+  const threads = { ...state.threads };
+  if (isEmptyBoardMetadata(metadata)) {
+    delete threads[threadId];
+  } else {
+    threads[threadId] = metadata;
+  }
+
+  return {
+    ...state,
+    threads,
+  };
+}
+
+function getThreadGroupLabel(metadata: ThreadBoardMetadata, groupBy: ThreadGroupBy) {
+  switch (groupBy) {
+    case "project":
+      return metadata.project || "未分类项目";
+    case "priority":
+      return PRIORITY_LABELS[metadata.priority ?? "none"];
+    case "stage":
+      return STAGE_LABELS[metadata.stage ?? "none"];
+    default:
+      return "全部任务";
+  }
+}
+
+function getThreadGroupSortValue(label: string, metadata: ThreadBoardMetadata, groupBy: ThreadGroupBy) {
+  switch (groupBy) {
+    case "priority":
+      return PRIORITY_ORDER.indexOf(metadata.priority ?? "none");
+    case "stage":
+      return STAGE_ORDER.indexOf(metadata.stage ?? "none");
+    case "project":
+      return label === "未分类项目" ? `~${label}` : label;
+    default:
+      return 0;
+  }
+}
+
+function App() {
+  const clientRef = useRef<DashboardClient | null>(null);
+  const [connectionState, setConnectionState] =
+    useState<ConnectionState>("disconnected");
+  const serverUrl = DEFAULT_CODEX_WS_URL;
+  const [account, setAccount] = useState<Account | null>(null);
+  const [rateLimits, setRateLimits] = useState<RateLimitSnapshot[]>([]);
+  const [threads, setThreads] = useState<Thread[]>([]);
+  const [lastSyncAt, setLastSyncAt] = useState<number | null>(null);
+  const [lastEvent, setLastEvent] = useState<string>("暂无事件");
+  const [lastError, setLastError] = useState<string | null>(null);
+  const [rateLimitError, setRateLimitError] = useState<string | null>(null);
+  const [authRegistry, setAuthRegistry] = useState<StoredCodexRegistry | null>(null);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [threadBoard, setThreadBoard] = useState<ThreadBoardState>({
+    schemaVersion: 1,
+    threads: {},
+  });
+  const [threadBoardError, setThreadBoardError] = useState<string | null>(null);
+  const [serverLogs, setServerLogs] = useState<string[]>([]);
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<ThreadFilter>("all");
+  const [groupBy, setGroupBy] = useState<ThreadGroupBy>("none");
+  const [editingThreadId, setEditingThreadId] = useState<string | null>(null);
+  const [isLaunching, setIsLaunching] = useState(false);
+  const [isSavingAccount, setIsSavingAccount] = useState(false);
+  const [switchingAccountKey, setSwitchingAccountKey] = useState<string | null>(null);
+  const isTauri = isTauriRuntime();
+  const deferredQuery = useDeferredValue(query);
+
+  const appendServerLog = useEffectEvent((line: string) => {
+    const normalized = line.trim();
+    if (!normalized) {
+      return;
+    }
+
+    startTransition(() => {
+      setServerLogs((current) => [...current, normalized].slice(-MAX_LOG_LINES));
+    });
+  });
+
+  const loadAuthAccounts = useEffectEvent(async () => {
+    if (!isTauri) {
+      return;
+    }
+
+    try {
+      const registry = await listLocalCodexAccounts();
+      startTransition(() => {
+        setAuthRegistry(registry);
+        setAuthError(null);
+      });
+    } catch (error) {
+      startTransition(() => {
+        setAuthError(formatLocalAccountError(error, "无法读取本地 Codex 账号列表。"));
+      });
+    }
+  });
+
+  const loadThreadBoard = useEffectEvent(async () => {
+    if (!isTauri) {
+      return;
+    }
+
+    try {
+      const state = await listThreadBoardMetadata();
+      startTransition(() => {
+        setThreadBoard(state);
+        setThreadBoardError(null);
+      });
+    } catch (error) {
+      startTransition(() => {
+        setThreadBoardError(getErrorMessage(error, "无法读取本地任务看板数据。"));
+      });
+    }
+  });
+
+  const persistThreadBoardMetadata = useEffectEvent(
+    async (threadId: string, metadata: ThreadBoardMetadata) => {
+      try {
+        const state = await setThreadBoardMetadata(
+          threadId,
+          normalizeThreadBoardMetadata(metadata),
+        );
+        startTransition(() => {
+          setThreadBoard(state);
+          setThreadBoardError(null);
+        });
+      } catch (error) {
+        startTransition(() => {
+          setThreadBoardError(getErrorMessage(error, "保存任务看板数据失败。"));
+        });
+      }
+    },
+  );
+
+  const updateThreadBoardMetadata = (
+    threadId: string,
+    patch: Partial<ThreadBoardMetadata>,
+    options: { persist?: boolean } = {},
+  ) => {
+    const nextMetadata = normalizeThreadBoardMetadata({
+      ...getThreadBoardMetadata(threadBoard, threadId),
+      ...patch,
+    });
+
+    setThreadBoard((current) =>
+      mergeThreadBoardState(current, threadId, nextMetadata),
+    );
+
+    if (options.persist !== false) {
+      void persistThreadBoardMetadata(threadId, nextMetadata);
+    }
+  };
+
+  const disconnectClient = useEffectEvent(async (reason = "Disconnected") => {
+    const activeClient = clientRef.current;
+    clientRef.current = null;
+
+    if (activeClient) {
+      activeClient.disconnect(reason);
+    }
+
+    setConnectionState("disconnected");
+    if (reason !== "Disconnected" && reason !== "Reconnecting") {
+      setLastError(reason);
+    }
+  });
+
+  const refreshSnapshot = useEffectEvent(async () => {
+    const client = clientRef.current;
+    if (!client || !client.isConnected()) {
+      return;
+    }
+
+    const [accountResult, rateLimitResult, threadResult] = await Promise.allSettled([
+      client.getAccount(),
+      client.getRateLimits(),
+      client.listThreads({
+        limit: 40,
+        sortKey: "updated_at",
+        sortDirection: "desc",
+      }),
+    ]);
+
+    startTransition(() => {
+      if (accountResult.status === "fulfilled") {
+        setAccount(accountResult.value.account);
+      }
+
+      if (rateLimitResult.status === "fulfilled") {
+        setRateLimits(normalizeRateLimits(rateLimitResult.value));
+        setRateLimitError(null);
+      } else {
+        setRateLimitError(
+          getErrorMessage(rateLimitResult.reason, "无法读取 Codex 用量数据。"),
+        );
+      }
+
+      if (threadResult.status === "fulfilled") {
+        setThreads(threadResult.value.data);
+      }
+
+      if (accountResult.status === "fulfilled" || threadResult.status === "fulfilled") {
+        setLastError(null);
+      } else {
+        setLastError("账号和任务状态暂时无法同步。");
+      }
+
+      setLastSyncAt(Date.now());
+    });
+  });
+
+  const handleNotification = useEffectEvent((notification: ServerNotification) => {
+    startTransition(() => {
+      setLastEvent(notification.method);
+      setLastSyncAt(Date.now());
+    });
+
+    switch (notification.method) {
+      case "account/updated":
+        void refreshSnapshot();
+        break;
+      case "account/rateLimits/updated":
+        startTransition(() => {
+          setRateLimitError(null);
+          setRateLimits((current) => {
+            if (current.length === 0) {
+              return [notification.params.rateLimits];
+            }
+
+            const targetKey =
+              notification.params.rateLimits.limitId ??
+              notification.params.rateLimits.limitName;
+            let updated = false;
+            const next = current.map((snapshot) => {
+              const snapshotKey = snapshot.limitId ?? snapshot.limitName;
+              if (snapshotKey === targetKey) {
+                updated = true;
+                return mergeRateLimitSnapshot(snapshot, notification.params.rateLimits);
+              }
+
+              return snapshot;
+            });
+
+            if (!updated) {
+              next.unshift(notification.params.rateLimits);
+            }
+
+            return next;
+          });
+        });
+        break;
+      case "thread/status/changed":
+        startTransition(() => {
+          setThreads((current) =>
+            current.map((thread) =>
+              thread.id === notification.params.threadId
+                ? { ...thread, status: notification.params.status }
+                : thread,
+            ),
+          );
+        });
+        break;
+      case "thread/started":
+      case "thread/archived":
+      case "thread/unarchived":
+      case "thread/name/updated":
+      case "thread/goal/updated":
+      case "thread/goal/cleared":
+        void refreshSnapshot();
+        break;
+      default:
+        break;
+    }
+  });
+
+  const connectToServer = useEffectEvent(
+    async (options?: { launchIfNeeded?: boolean }) => {
+      setConnectionState("connecting");
+      setLastError(null);
+      setRateLimitError(null);
+
+      await disconnectClient("Reconnecting");
+
+      const createClient = () =>
+        new CodexAppServerClient({
+          onNotification: handleNotification,
+          onDisconnect: (reason) => {
+            clientRef.current = null;
+            setConnectionState("disconnected");
+            if (reason !== "Disconnected") {
+              setLastError(reason);
+            }
+          },
+        });
+
+      const createShellClient = () =>
+        new CodexAppServerShellClient({
+          onNotification: handleNotification,
+          onDisconnect: (reason) => {
+            clientRef.current = null;
+            setConnectionState("disconnected");
+            if (reason !== "Disconnected") {
+              setLastError(reason);
+            }
+          },
+          onServerLog: appendServerLog,
+        });
+
+      const attemptConnection = async () => {
+        const nextClient = isTauri ? createShellClient() : createClient();
+        if (isTauri) {
+          await nextClient.connect(serverUrl);
+        } else {
+          await nextClient.connect(serverUrl);
+        }
+        clientRef.current = nextClient;
+      };
+
+      try {
+        setIsLaunching(isTauri && Boolean(options?.launchIfNeeded));
+        await attemptConnection();
+
+        setConnectionState("connected");
+        await refreshSnapshot();
+      } catch (error) {
+        clientRef.current = null;
+        setConnectionState("error");
+        setLastError(
+          error instanceof Error ? error.message : "无法连接到 Codex app-server。",
+        );
+      } finally {
+        setIsLaunching(false);
+      }
+    },
+  );
+
+  const handleSwitchAccount = useEffectEvent(async (accountKey: string) => {
+    if (!isTauri || switchingAccountKey) {
+      return;
+    }
+
+    setSwitchingAccountKey(accountKey);
+    setAuthError(null);
+    setLastError(null);
+    setRateLimitError(null);
+
+    try {
+      await disconnectClient("Reconnecting");
+      const result = await switchLocalCodexAccount(accountKey);
+      setAuthRegistry(result.registry);
+      setLastEvent("account/switched");
+      await connectToServer({ launchIfNeeded: true });
+    } catch (error) {
+      setConnectionState("error");
+      setAuthError(formatLocalAccountError(error, "切换账号失败。"));
+    } finally {
+      setSwitchingAccountKey(null);
+    }
+  });
+
+  const handleSaveCurrentAccount = useEffectEvent(async () => {
+    if (!isTauri || isSavingAccount) {
+      return;
+    }
+
+    setIsSavingAccount(true);
+    setAuthError(null);
+
+    try {
+      const registry = await saveCurrentCodexAccount();
+      setAuthRegistry(registry);
+      setLastEvent("account/saved");
+    } catch (error) {
+      setAuthError(formatLocalAccountError(error, "保存当前账号失败。"));
+    } finally {
+      setIsSavingAccount(false);
+    }
+  });
+
+  useEffect(() => {
+    if (isTauri) {
+      void loadAuthAccounts();
+      void loadThreadBoard();
+      void connectToServer({ launchIfNeeded: true });
+    }
+
+    return () => {
+      void disconnectClient();
+    };
+  }, [isTauri]);
+
+  useEffect(() => {
+    if (!isTauri) {
+      return undefined;
+    }
+
+    const appWindow = getCurrentWindow();
+    let disposed = false;
+    let isSnapping = false;
+    let snapTimer: number | null = null;
+    let unlistenMoved: (() => void) | null = null;
+
+    void appWindow
+      .onMoved(() => {
+        if (disposed || isSnapping) {
+          return;
+        }
+
+        if (snapTimer !== null) {
+          window.clearTimeout(snapTimer);
+        }
+
+        snapTimer = window.setTimeout(() => {
+          isSnapping = true;
+          void snapWindowToScreenEdge(appWindow).finally(() => {
+            window.setTimeout(() => {
+              isSnapping = false;
+            }, SNAP_SETTLE_DELAY_MS);
+          });
+        }, SNAP_SETTLE_DELAY_MS);
+      })
+      .then((unlisten) => {
+        if (disposed) {
+          unlisten();
+        } else {
+          unlistenMoved = unlisten;
+        }
+      })
+      .catch(() => {
+        // Window snapping is a convenience layer; the status board should still work without it.
+      });
+
+    return () => {
+      disposed = true;
+      if (snapTimer !== null) {
+        window.clearTimeout(snapTimer);
+      }
+      unlistenMoved?.();
+    };
+  }, [isTauri]);
+
+  useEffect(() => {
+    if (connectionState !== "connected") {
+      return undefined;
+    }
+
+    const intervalId = window.setInterval(() => {
+      void refreshSnapshot();
+    }, 20_000);
+
+    return () => window.clearInterval(intervalId);
+  }, [connectionState]);
+
+  const normalizedQuery = deferredQuery.trim().toLowerCase();
+  const visibleThreads = threads
+    .filter((thread) => {
+      if (filter !== "all" && getThreadFilterKey(thread) !== filter) {
+        return false;
+      }
+
+      if (!normalizedQuery) {
+        return true;
+      }
+
+      const metadata = getThreadBoardMetadata(threadBoard, thread.id);
+      const haystack = [
+        getThreadLabel(thread),
+        thread.preview,
+        thread.cwd,
+        thread.modelProvider,
+        thread.source,
+        metadata.note,
+        metadata.project,
+        metadata.priority ? PRIORITY_LABELS[metadata.priority] : null,
+        metadata.stage ? STAGE_LABELS[metadata.stage] : null,
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+
+      return haystack.includes(normalizedQuery);
+    })
+    .sort((left, right) => {
+      const leftPinned = getThreadBoardMetadata(threadBoard, left.id).pinned;
+      const rightPinned = getThreadBoardMetadata(threadBoard, right.id).pinned;
+
+      if (leftPinned !== rightPinned) {
+        return leftPinned ? -1 : 1;
+      }
+
+      return right.updatedAt - left.updatedAt;
+    });
+
+  const connectionBadge =
+    connectionState === "connected"
+      ? "已连接"
+      : connectionState === "connecting"
+        ? "连接中"
+        : connectionState === "error"
+          ? "需要处理"
+          : "未连接";
+  const isConnected = connectionState === "connected";
+  const isBusy = connectionState === "connecting" || isLaunching;
+  const displayedError = formatConnectionError(lastError);
+  const displayedRateLimitError = formatRateLimitError(rateLimitError);
+  const authAccounts = authRegistry?.accounts ?? [];
+  const activeAuthKey = authRegistry?.active_account_key ?? null;
+  const threadGroups = (() => {
+    if (groupBy === "none") {
+      return [{ key: "all", label: "全部任务", threads: visibleThreads }];
+    }
+
+    const groups = new Map<
+      string,
+      { label: string; sortValue: number | string; threads: Thread[] }
+    >();
+
+    for (const thread of visibleThreads) {
+      const metadata = getThreadBoardMetadata(threadBoard, thread.id);
+      const label = getThreadGroupLabel(metadata, groupBy);
+      const key = `${groupBy}:${label}`;
+
+      if (!groups.has(key)) {
+        groups.set(key, {
+          label,
+          sortValue: getThreadGroupSortValue(label, metadata, groupBy),
+          threads: [],
+        });
+      }
+
+      groups.get(key)?.threads.push(thread);
+    }
+
+    return Array.from(groups.entries())
+      .map(([key, value]) => ({ key, ...value }))
+      .sort((left, right) => {
+        if (typeof left.sortValue === "number" && typeof right.sortValue === "number") {
+          return left.sortValue - right.sortValue;
+        }
+
+        return String(left.sortValue).localeCompare(String(right.sortValue), "zh-CN");
+      });
+  })();
+
+  return (
+    <main className="shell">
+      <header className="topbar" data-tauri-drag-region>
+        <div>
+          <p className="eyebrow">Codex 状态</p>
+          <h1>{describeAccount(account)}</h1>
+          <p className="subtitle">
+            {lastSyncAt ? `${formatRelativeTime(lastSyncAt / 1000)}更新` : "等待数据"}
+          </p>
+        </div>
+        <div className={`status-pill tone-${connectionState}`}>{connectionBadge}</div>
+      </header>
+
+      <section className="panel connection-panel">
+        <div className="action-row">
+          <button
+            className="primary"
+            type="button"
+            onClick={() => void connectToServer({ launchIfNeeded: isTauri })}
+            disabled={isBusy || !isTauri}
+          >
+            {isBusy ? "连接中..." : isConnected ? "重新连接" : "重试连接"}
+          </button>
+          <button
+            type="button"
+            onClick={() => void refreshSnapshot()}
+            disabled={!isConnected}
+          >
+            刷新
+          </button>
+        </div>
+
+        {!isTauri ? (
+          <p className="hint">
+            请在 Tauri 客户端内运行，才能使用本地 stdio 桥接；浏览器预览仅用于查看界面。
+          </p>
+        ) : null}
+
+        {displayedError ? <p className="error-text">{displayedError}</p> : null}
+        {lastError && serverLogs.length > 0 ? (
+          <div className="log-list compact-log">
+            {serverLogs.map((line, index) => (
+              <code className="log-line" key={`${line}-${index}`}>
+                {line}
+              </code>
+            ))}
+          </div>
+        ) : null}
+      </section>
+
+      {isTauri ? (
+        <section className="panel account-panel">
+          <div className="section-header">
+            <div>
+              <p className="section-eyebrow">账号</p>
+              <h2>账号切换</h2>
+            </div>
+            <span className="section-note">{authAccounts.length} 个账号</span>
+          </div>
+
+          <div className="action-row account-actions">
+            <button
+              type="button"
+              onClick={() => void handleSaveCurrentAccount()}
+              disabled={isSavingAccount || Boolean(switchingAccountKey)}
+            >
+              {isSavingAccount ? "保存中..." : "保存当前账号"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void loadAuthAccounts()}
+              disabled={isSavingAccount || Boolean(switchingAccountKey)}
+            >
+              刷新账号
+            </button>
+          </div>
+
+          {authError ? <p className="error-text">{authError}</p> : null}
+
+          {authAccounts.length === 0 ? (
+            <p className="empty-state">
+              暂无已保存账号。先用官方 Codex 登录一次，再点击“保存当前账号”。
+            </p>
+          ) : (
+            <div className="account-list">
+              {authAccounts.map((authAccount) => {
+                const isActiveAccount = authAccount.account_key === activeAuthKey;
+                const isSwitching = switchingAccountKey === authAccount.account_key;
+
+                return (
+                  <article className="account-card" key={authAccount.account_key}>
+                    <div>
+                      <h3>{getAuthAccountTitle(authAccount)}</h3>
+                      <p>
+                        {formatAuthPlan(authAccount.plan)} ·{" "}
+                        {authAccount.auth_mode ?? "chatgpt"} · 最近使用{" "}
+                        {formatUnixTime(authAccount.last_used_at)}
+                      </p>
+                    </div>
+                    {isActiveAccount ? (
+                      <span className="status-pill tone-connected">当前</span>
+                    ) : (
+                      <button
+                        type="button"
+                        className="chip"
+                        disabled={Boolean(switchingAccountKey) || isSavingAccount}
+                        onClick={() => void handleSwitchAccount(authAccount.account_key)}
+                      >
+                        {isSwitching ? "切换中..." : "切换"}
+                      </button>
+                    )}
+                  </article>
+                );
+              })}
+            </div>
+          )}
+
+          <p className="hint">
+            账号切换由本应用本地完成：备份当前 auth.json，替换为目标账号快照，然后重启 Codex app-server。
+          </p>
+        </section>
+      ) : null}
+
+      {isConnected ? (
+        <section className="panel">
+        <div className="section-header">
+          <div>
+            <p className="section-eyebrow">用量</p>
+            <h2>额度状态</h2>
+          </div>
+          <span className="section-note">{rateLimits.length || 0} 个额度池</span>
+        </div>
+
+        {displayedRateLimitError ? (
+          <p className="warning-text">{displayedRateLimitError}</p>
+        ) : null}
+
+        {rateLimits.length === 0 ? (
+          <p className="empty-state">
+            {displayedRateLimitError
+              ? "任务看板会继续同步；可以稍后点击刷新重试用量读取。"
+              : "暂无额度数据。连接已登录的 Codex 会话后，这里会自动显示剩余用量。"}
+          </p>
+        ) : (
+          <div className="usage-list">
+            {rateLimits.map((snapshot, index) => {
+              const primaryTone = getUsageTone(snapshot.primary?.usedPercent);
+
+              return (
+                <article
+                  className={`usage-card usage-${primaryTone}`}
+                  key={`${snapshot.limitId ?? snapshot.limitName ?? "default"}-${index}`}
+                >
+                  <div className="usage-header">
+                    <div>
+                      <h3>{snapshot.limitName ?? snapshot.limitId ?? "默认额度池"}</h3>
+                      <p>{formatPlanType(snapshot.planType)}</p>
+                    </div>
+                    <div className="usage-badge-stack">
+                      <span className={`usage-badge usage-badge-${primaryTone}`}>
+                        {getUsageToneText(snapshot.primary?.usedPercent)}
+                      </span>
+                      <span className="usage-badge">
+                        {snapshot.rateLimitReachedType ? "受限" : "正常"}
+                      </span>
+                    </div>
+                  </div>
+
+                <div className="meter-group">
+                  <div className="meter-copy">
+                    <span>
+                      {formatRateLimitWindowLabel(snapshot.primary, "短周期使用量")}
+                    </span>
+                    <strong>{formatPercent(snapshot.primary?.usedPercent)}</strong>
+                  </div>
+                  <div className="meter-track">
+                    <div
+                      className={`meter-fill primary usage-fill-${primaryTone}`}
+                      style={{
+                        width: `${Math.min(snapshot.primary?.usedPercent ?? 0, 100)}%`,
+                      }}
+                    />
+                  </div>
+                  <span className="meter-note">
+                    重置时间 {formatResetTime(snapshot.primary?.resetsAt)}
+                  </span>
+                </div>
+
+                <div className="meter-group">
+                  <div className="meter-copy">
+                    <span>
+                      {formatRateLimitWindowLabel(snapshot.secondary, "长周期使用量")}
+                    </span>
+                    <strong>{formatPercent(snapshot.secondary?.usedPercent)}</strong>
+                  </div>
+                  <div className="meter-track">
+                    <div
+                      className="meter-fill secondary"
+                      style={{
+                        width: `${Math.min(snapshot.secondary?.usedPercent ?? 0, 100)}%`,
+                      }}
+                    />
+                  </div>
+                  <span className="meter-note">
+                    重置时间 {formatResetTime(snapshot.secondary?.resetsAt)}
+                  </span>
+                </div>
+
+                <div className="usage-footer">
+                  <span>
+                    点数{" "}
+                    {snapshot.credits?.unlimited
+                      ? "不限"
+                      : snapshot.credits?.balance ?? "暂无"}
+                  </span>
+                  <span>
+                    剩余额度{" "}
+                    {snapshot.individualLimit
+                      ? `${Math.round(snapshot.individualLimit.remainingPercent)}%`
+                      : "暂无"}
+                  </span>
+                </div>
+                </article>
+              );
+            })}
+          </div>
+        )}
+        </section>
+      ) : null}
+
+      {isConnected ? (
+        <section className="panel">
+        <div className="section-header">
+          <div>
+            <p className="section-eyebrow">任务</p>
+            <h2>状态看板</h2>
+          </div>
+          <span className="section-note">显示 {visibleThreads.length} 个</span>
+        </div>
+
+        <div className="toolbar">
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.currentTarget.value)}
+            placeholder="搜索标题、备注、项目、阶段或路径"
+          />
+          <select
+            aria-label="任务分组方式"
+            value={groupBy}
+            onChange={(event) => setGroupBy(event.currentTarget.value as ThreadGroupBy)}
+          >
+            {(["none", "project", "priority", "stage"] as const).map((value) => (
+              <option key={value} value={value}>
+                {THREAD_GROUP_LABELS[value]}
+              </option>
+            ))}
+          </select>
+          <div className="filter-row">
+            {(["all", "recent", "idle", "systemError"] as const).map((value) => (
+              <button
+                key={value}
+                type="button"
+                className={filter === value ? "chip active" : "chip"}
+                onClick={() => setFilter(value)}
+              >
+                {THREAD_FILTER_LABELS[value]}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {threadBoardError ? <p className="error-text">{threadBoardError}</p> : null}
+
+        {visibleThreads.length === 0 ? (
+          <p className="empty-state">
+            暂无匹配任务。可以放宽筛选条件，或等待下一次同步。
+          </p>
+        ) : (
+          <div className="thread-list">
+            {threadGroups.map((group) => (
+              <div className="thread-group" key={group.key}>
+                {groupBy !== "none" ? (
+                  <div className="thread-group-header">
+                    <span>{group.label}</span>
+                    <span>{group.threads.length} 个</span>
+                  </div>
+                ) : null}
+
+                {group.threads.map((thread) => {
+                  const metadata = getThreadBoardMetadata(threadBoard, thread.id);
+                  const boardChips = getBoardChips(metadata);
+                  const isEditingBoard = editingThreadId === thread.id;
+                  const threadTone = getThreadStatusTone(thread);
+
+                  return (
+                    <article
+                      className={`thread-card thread-${threadTone} ${
+                        metadata.pinned ? "thread-pinned" : ""
+                      }`}
+                      key={thread.id}
+                    >
+                      <div className="thread-topline">
+                        <div>
+                          <h3>{getThreadLabel(thread)}</h3>
+                          <p className="thread-meta">
+                            {shortenPath(thread.cwd)} / {thread.modelProvider} /{" "}
+                            {String(thread.source)}
+                          </p>
+                        </div>
+                        <div className="thread-actions">
+                          <button
+                            className={
+                              metadata.pinned
+                                ? "icon-button pinned active"
+                                : "icon-button pinned"
+                            }
+                            title={metadata.pinned ? "取消关注" : "标记关注"}
+                            type="button"
+                            onClick={() =>
+                              updateThreadBoardMetadata(thread.id, {
+                                pinned: !metadata.pinned,
+                              })
+                            }
+                          >
+                            {metadata.pinned ? "★" : "☆"}
+                          </button>
+                          <div className={`status-pill tone-${threadTone}`}>
+                            {getThreadStatusText(thread)}
+                          </div>
+                        </div>
+                      </div>
+
+                      {hasBoardDetails(metadata) ? (
+                        <div className="board-chip-row">
+                          {boardChips.map((chip) => (
+                            <span className={chip.className} key={chip.label}>
+                              {chip.label}
+                            </span>
+                          ))}
+                          {metadata.note ? (
+                            <span className="board-note">备注：{metadata.note}</span>
+                          ) : null}
+                        </div>
+                      ) : null}
+
+                      <p className="thread-preview">
+                        {thread.preview || "暂无预览内容。"}
+                      </p>
+
+                      {isEditingBoard ? (
+                        <div className="thread-board-editor">
+                          <label>
+                            备注
+                            <input
+                              value={metadata.note ?? ""}
+                              onBlur={() =>
+                                void persistThreadBoardMetadata(thread.id, metadata)
+                              }
+                              onChange={(event) =>
+                                updateThreadBoardMetadata(
+                                  thread.id,
+                                  { note: event.currentTarget.value },
+                                  { persist: false },
+                                )
+                              }
+                              placeholder="等接口 / 等设计 / 今日处理"
+                            />
+                          </label>
+                          <label>
+                            项目
+                            <input
+                              value={metadata.project ?? ""}
+                              onBlur={() =>
+                                void persistThreadBoardMetadata(thread.id, metadata)
+                              }
+                              onChange={(event) =>
+                                updateThreadBoardMetadata(
+                                  thread.id,
+                                  { project: event.currentTarget.value },
+                                  { persist: false },
+                                )
+                              }
+                              placeholder="项目名"
+                            />
+                          </label>
+                          <label>
+                            优先级
+                            <select
+                              value={metadata.priority ?? "none"}
+                              onChange={(event) =>
+                                updateThreadBoardMetadata(thread.id, {
+                                  priority: event.currentTarget.value as ThreadPriority,
+                                })
+                              }
+                            >
+                              {(["none", "high", "medium", "low"] as const).map(
+                                (value) => (
+                                  <option key={value} value={value}>
+                                    {PRIORITY_LABELS[value]}
+                                  </option>
+                                ),
+                              )}
+                            </select>
+                          </label>
+                          <label>
+                            阶段
+                            <select
+                              value={metadata.stage ?? "none"}
+                              onChange={(event) =>
+                                updateThreadBoardMetadata(thread.id, {
+                                  stage: event.currentTarget.value as ThreadStage,
+                                })
+                              }
+                            >
+                              {(["none", "todo", "doing", "waiting", "done"] as const).map(
+                                (value) => (
+                                  <option key={value} value={value}>
+                                    {STAGE_LABELS[value]}
+                                  </option>
+                                ),
+                              )}
+                            </select>
+                          </label>
+                        </div>
+                      ) : null}
+
+                      <div className="thread-footer">
+                        <span>{formatRelativeTime(thread.updatedAt)}</span>
+                        <span>{thread.cliVersion}</span>
+                        <button
+                          className="link-button"
+                          type="button"
+                          onClick={() =>
+                            setEditingThreadId(isEditingBoard ? null : thread.id)
+                          }
+                        >
+                          {isEditingBoard ? "收起看板" : "编辑看板"}
+                        </button>
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            ))}
+          </div>
+        )}
+        <p className="event-line">最近事件：{formatEventName(lastEvent)}</p>
+        </section>
+      ) : null}
+    </main>
+  );
+}
+
+export default App;
