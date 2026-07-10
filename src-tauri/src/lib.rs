@@ -4,7 +4,9 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    process::Command,
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
@@ -14,6 +16,7 @@ use tauri::{
 use tauri_plugin_global_shortcut::ShortcutState;
 
 const MAIN_WINDOW_LABEL: &str = "main";
+const CODEX_DESKTOP_BUNDLE_ID: &str = "com.openai.codex";
 const TRAY_MENU_TOGGLE: &str = "toggle-window";
 const TRAY_MENU_QUIT: &str = "quit";
 
@@ -544,6 +547,35 @@ fn switch_local_codex_account(account_key: String) -> Result<AccountSwitchResult
 }
 
 #[tauri::command]
+fn restart_codex_desktop_client() -> Result<(), String> {
+    let quit_status = Command::new("osascript")
+        .arg("-e")
+        .arg(format!(
+            r#"tell application id "{CODEX_DESKTOP_BUNDLE_ID}" to quit"#
+        ))
+        .status();
+
+    if !matches!(quit_status, Ok(status) if status.success()) {
+        let _ = Command::new("pkill").args(["-TERM", "-x", "Codex"]).status();
+    }
+
+    thread::sleep(Duration::from_millis(1_500));
+
+    let open_status = Command::new("open")
+        .args(["-b", CODEX_DESKTOP_BUNDLE_ID])
+        .status()
+        .map_err(|error| format!("Unable to open Codex desktop client: {error}"))?;
+
+    if !open_status.success() {
+        return Err(format!(
+            "Unable to open Codex desktop client with bundle id {CODEX_DESKTOP_BUNDLE_ID}."
+        ));
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
 fn list_thread_board_metadata() -> Result<ThreadBoardState, String> {
     read_thread_board_state()
 }
@@ -599,6 +631,7 @@ pub fn run() {
             list_local_codex_accounts,
             save_current_codex_account,
             switch_local_codex_account,
+            restart_codex_desktop_client,
             list_thread_board_metadata,
             set_thread_board_metadata
         ])

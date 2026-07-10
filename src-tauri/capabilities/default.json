@@ -8,20 +8,35 @@
     "core:window:allow-available-monitors",
     "core:window:allow-outer-position",
     "core:window:allow-outer-size",
+    "core:window:allow-set-min-size",
     "core:window:allow-set-position",
+    "core:window:allow-set-size",
     "core:window:allow-start-dragging",
     "opener:default",
     {
       "identifier": "shell:allow-spawn",
       "allow": [
         {
-          "name": "codex-app-server",
-          "cmd": "codex",
+          "name": "codex-app-server-bundled",
+          "cmd": "/Applications/Codex.app/Contents/Resources/codex",
           "args": ["app-server"]
         },
         {
-          "name": "codex-app-server-nvm",
-          "cmd": "$HOME/.nvm/versions/node/v20.19.0/bin/codex",
+          "name": "codex-app-server-user-bundled",
+          "cmd": "$HOME/Applications/Codex.app/Contents/Resources/codex",
+          "args": ["app-server"]
+        },
+        {
+          "name": "codex-app-server-zsh-login",
+          "cmd": "/bin/zsh",
+          "args": [
+            "-lc",
+            "source \"$HOME/.zshrc\" >/dev/null 2>&1; exec codex app-server"
+          ]
+        },
+        {
+          "name": "codex-app-server",
+          "cmd": "codex",
           "args": ["app-server"]
         }
       ]

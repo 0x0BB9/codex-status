@@ -4,8 +4,11 @@ import type {
   ServerNotification,
 } from "../generated";
 import type {
+  CancelLoginAccountResponse,
   GetAccountResponse,
   GetAccountRateLimitsResponse,
+  LoginAccountParams,
+  LoginAccountResponse,
   ThreadListParams,
   ThreadListResponse,
 } from "../generated/v2";
@@ -27,7 +30,26 @@ type CodexAppServerShellClientOptions = {
 };
 
 const RPC_TIMEOUT_MS = 8_000;
-const COMMAND_NAMES = ["codex-app-server", "codex-app-server-nvm"] as const;
+const ZSH_CODEX_APP_SERVER_SCRIPT =
+  'source "$HOME/.zshrc" >/dev/null 2>&1; exec codex app-server';
+const COMMANDS = [
+  {
+    args: ["app-server"],
+    name: "codex-app-server-bundled",
+  },
+  {
+    args: ["app-server"],
+    name: "codex-app-server-user-bundled",
+  },
+  {
+    args: ["-lc", ZSH_CODEX_APP_SERVER_SCRIPT],
+    name: "codex-app-server-zsh-login",
+  },
+  {
+    args: ["app-server"],
+    name: "codex-app-server",
+  },
+] as const;
 
 export function isTauriRuntime() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -76,14 +98,14 @@ export class CodexAppServerShellClient {
     const { Command } = await import("@tauri-apps/plugin-shell");
     const errors: string[] = [];
 
-    for (const commandName of COMMAND_NAMES) {
+    for (const commandConfig of COMMANDS) {
       try {
-        const command = Command.create(commandName, ["app-server"]);
+        const command = Command.create(commandConfig.name, [...commandConfig.args]);
 
         command.stdout.on("data", (chunk) => this.handleStdout(chunk));
         command.stderr.on("data", (line) => this.options.onServerLog?.(line));
         command.on("error", (error) => {
-          this.options.onServerLog?.(`${commandName}: ${String(error)}`);
+          this.options.onServerLog?.(`${commandConfig.name}: ${String(error)}`);
         });
         command.on("close", (payload) => {
           const wasManual = this.closing;
@@ -97,7 +119,7 @@ export class CodexAppServerShellClient {
           }
 
           this.options.onServerLog?.(
-            `${commandName} closed: code=${payload.code ?? "null"} signal=${
+            `${commandConfig.name} closed: code=${payload.code ?? "null"} signal=${
               payload.signal ?? "null"
             }`,
           );
@@ -105,11 +127,11 @@ export class CodexAppServerShellClient {
         });
 
         const child = await command.spawn();
-        this.options.onServerLog?.(`Started ${commandName}.`);
+        this.options.onServerLog?.(`Started ${commandConfig.name}.`);
         return child;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        errors.push(`${commandName}: ${message}`);
+        errors.push(`${commandConfig.name}: ${message}`);
       }
     }
 
@@ -138,6 +160,14 @@ export class CodexAppServerShellClient {
 
   getRateLimits() {
     return this.request<GetAccountRateLimitsResponse>("account/rateLimits/read");
+  }
+
+  startAccountLogin(params: LoginAccountParams) {
+    return this.request<LoginAccountResponse>("account/login/start", params);
+  }
+
+  cancelAccountLogin(loginId: string) {
+    return this.request<CancelLoginAccountResponse>("account/login/cancel", { loginId });
   }
 
   listThreads(params: ThreadListParams) {

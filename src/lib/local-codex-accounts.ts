@@ -42,3 +42,7 @@ export async function switchLocalCodexAccount(accountKey: string) {
     accountKey,
   });
 }
+
+export async function restartCodexDesktopClient() {
+  return invoke<void>("restart_codex_desktop_client");
+}

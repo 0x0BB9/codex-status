@@ -4,8 +4,11 @@ import type {
   ServerNotification,
 } from "../generated";
 import type {
+  CancelLoginAccountResponse,
   GetAccountResponse,
   GetAccountRateLimitsResponse,
+  LoginAccountParams,
+  LoginAccountResponse,
   ThreadListParams,
   ThreadListResponse,
 } from "../generated/v2";
@@ -133,6 +136,14 @@ export class CodexAppServerClient {
 
   getRateLimits() {
     return this.request<GetAccountRateLimitsResponse>("account/rateLimits/read");
+  }
+
+  startAccountLogin(params: LoginAccountParams) {
+    return this.request<LoginAccountResponse>("account/login/start", params);
+  }
+
+  cancelAccountLogin(loginId: string) {
+    return this.request<CancelLoginAccountResponse>("account/login/cancel", { loginId });
   }
 
   listThreads(params: ThreadListParams) {

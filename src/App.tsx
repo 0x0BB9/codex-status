@@ -10,17 +10,23 @@ import {
   availableMonitors,
   getCurrentWindow,
   PhysicalPosition,
+  PhysicalSize,
 } from "@tauri-apps/api/window";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import type { PlanType, ServerNotification } from "./generated";
 import type {
   Account,
+  AccountLoginCompletedNotification,
   GetAccountRateLimitsResponse,
+  LoginAccountParams,
+  LoginAccountResponse,
   RateLimitSnapshot,
   Thread,
 } from "./generated/v2";
 import { CodexAppServerClient, DEFAULT_CODEX_WS_URL } from "./lib/codex-app-server";
 import {
   listLocalCodexAccounts,
+  restartCodexDesktopClient,
   saveCurrentCodexAccount,
   switchLocalCodexAccount,
   type StoredCodexRegistry,
@@ -41,9 +47,19 @@ import {
 import "./App.css";
 
 type ConnectionState = "disconnected" | "connecting" | "connected" | "error";
+type FloatingMode = "expanded" | "peek";
 type ThreadFilter = "all" | "recent" | "idle" | "systemError";
 type ThreadGroupBy = "none" | "project" | "priority" | "stage";
+type AccountLoginFlow = {
+  authUrl?: string;
+  loginId: string;
+  startedAt: number;
+  type: "chatgpt" | "chatgptDeviceCode";
+  userCode?: string;
+  verificationUrl?: string;
+};
 type DashboardClient = {
+  cancelAccountLogin: (loginId: string) => Promise<unknown>;
   connect: (target: string) => Promise<unknown>;
   disconnect: (reason?: string) => void;
   getAccount: () => Promise<{ account: Account | null }>;
@@ -54,9 +70,12 @@ type DashboardClient = {
     sortDirection: "desc";
     sortKey: "updated_at";
   }) => Promise<{ data: Thread[] }>;
+  startAccountLogin: (params: LoginAccountParams) => Promise<LoginAccountResponse>;
 };
 
 const MAX_LOG_LINES = 6;
+const RESTART_CODEX_CLIENT_AFTER_SWITCH_KEY =
+  "codex-status-floater.restartCodexClientAfterSwitch";
 const PLAN_TYPE_LABELS: Record<PlanType, string> = {
   free: "免费版",
   go: "Go",
@@ -101,9 +120,25 @@ const STAGE_ORDER: ThreadStage[] = ["todo", "doing", "waiting", "done", "none"];
 const RECENT_THREAD_ACTIVITY_SECONDS = 10 * 60;
 const SNAP_EDGE_DISTANCE = 28;
 const SNAP_SETTLE_DELAY_MS = 160;
+const FLOATING_DIM_DELAY_MS = 2_500;
+const FLOATING_COLLAPSE_DELAY_MS = 7_000;
+const FLOATING_RIGHT_DOCK_TOLERANCE = SNAP_EDGE_DISTANCE + 8;
+const FLOATING_PEEK_LOGICAL_SIZE = { width: 82, height: 168 };
+const FLOATING_EXPANDED_MIN_LOGICAL_SIZE = { width: 360, height: 620 };
+const FLOATING_DEFAULT_EXPANDED_LOGICAL_SIZE = { width: 430, height: 860 };
 
 type AppWindow = ReturnType<typeof getCurrentWindow>;
 type MonitorInfo = Awaited<ReturnType<typeof availableMonitors>>[number];
+type FloatingWindowSnapshot = {
+  position: {
+    x: number;
+    y: number;
+  };
+  size: {
+    height: number;
+    width: number;
+  };
+};
 
 function formatPlanType(planType: PlanType | null | undefined) {
   if (!planType) {
@@ -148,6 +183,52 @@ function getUsageToneText(value: number | null | undefined) {
     default:
       return "五小时用量未知";
   }
+}
+
+function getCompactUsageToneText(value: number | null | undefined) {
+  switch (getUsageTone(value)) {
+    case "danger":
+      return "紧张";
+    case "warning":
+      return "偏高";
+    case "safe":
+      return "正常";
+    default:
+      return "未知";
+  }
+}
+
+function getGlobalFiveHourUsage(rateLimits: RateLimitSnapshot[]) {
+  const primaryWindows = rateLimits
+    .map((snapshot) => ({
+      poolLabel: snapshot.limitName ?? snapshot.limitId ?? "默认额度池",
+      window: snapshot.primary,
+    }))
+    .filter((entry) => entry.window?.usedPercent !== undefined);
+  const fiveHourWindows = primaryWindows.filter(
+    (entry) => entry.window?.windowDurationMins === 300,
+  );
+  const candidates = fiveHourWindows.length > 0 ? fiveHourWindows : primaryWindows;
+  const tightest = candidates.reduce<(typeof candidates)[number] | null>(
+    (current, entry) => {
+      if (!current) {
+        return entry;
+      }
+
+      return (entry.window?.usedPercent ?? -1) > (current.window?.usedPercent ?? -1)
+        ? entry
+        : current;
+    },
+    null,
+  );
+  const usedPercent = tightest?.window?.usedPercent ?? null;
+
+  return {
+    poolLabel: tightest?.poolLabel ?? null,
+    resetsAt: tightest?.window?.resetsAt ?? null,
+    tone: getUsageTone(usedPercent),
+    usedPercent,
+  };
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -224,6 +305,41 @@ async function snapWindowToScreenEdge(appWindow: AppWindow) {
   if (nextX !== position.x || nextY !== position.y) {
     await appWindow.setPosition(new PhysicalPosition(nextX, nextY));
   }
+}
+
+function getPhysicalSizeFromLogical(
+  logicalSize: { height: number; width: number },
+  monitor: MonitorInfo,
+) {
+  return new PhysicalSize(
+    Math.round(logicalSize.width * monitor.scaleFactor),
+    Math.round(logicalSize.height * monitor.scaleFactor),
+  );
+}
+
+function getRightDockPosition(
+  monitor: MonitorInfo,
+  width: number,
+  height: number,
+  preferredY: number,
+) {
+  const minY = monitor.workArea.position.y;
+  const maxY = minY + monitor.workArea.size.height - height;
+
+  return new PhysicalPosition(
+    Math.round(monitor.workArea.position.x + monitor.workArea.size.width - width),
+    Math.round(clamp(preferredY, minY, maxY)),
+  );
+}
+
+function isNearRightDock(
+  position: PhysicalPosition,
+  width: number,
+  monitor: MonitorInfo,
+) {
+  const rightEdge = monitor.workArea.position.x + monitor.workArea.size.width;
+
+  return Math.abs(position.x + width - rightEdge) <= FLOATING_RIGHT_DOCK_TOLERANCE;
 }
 
 function formatRelativeTime(timestampSeconds: number) {
@@ -423,6 +539,12 @@ function formatEventName(method: string) {
       return "账号已切换";
     case "account/saved":
       return "当前账号已保存";
+    case "account/login/completed":
+      return "账号登录已完成";
+    case "account/login/started":
+      return "账号登录已开始";
+    case "codex-client/restarted":
+      return "Codex 客户端已重启";
     case "thread/status/changed":
       return "任务状态已更新";
     case "thread/started":
@@ -668,6 +790,9 @@ function getThreadGroupSortValue(label: string, metadata: ThreadBoardMetadata, g
 
 function App() {
   const clientRef = useRef<DashboardClient | null>(null);
+  const collapseTimerRef = useRef<number | null>(null);
+  const dimTimerRef = useRef<number | null>(null);
+  const lastExpandedWindowRef = useRef<FloatingWindowSnapshot | null>(null);
   const [connectionState, setConnectionState] =
     useState<ConnectionState>("disconnected");
   const serverUrl = DEFAULT_CODEX_WS_URL;
@@ -690,8 +815,30 @@ function App() {
   const [filter, setFilter] = useState<ThreadFilter>("all");
   const [groupBy, setGroupBy] = useState<ThreadGroupBy>("none");
   const [editingThreadId, setEditingThreadId] = useState<string | null>(null);
+  const [floatingMode, setFloatingMode] = useState<FloatingMode>("expanded");
+  const [isFloatingDimmed, setIsFloatingDimmed] = useState(false);
   const [isLaunching, setIsLaunching] = useState(false);
+  const [isStartingAccountLogin, setIsStartingAccountLogin] = useState(false);
   const [isSavingAccount, setIsSavingAccount] = useState(false);
+  const [isRestartingCodexClient, setIsRestartingCodexClient] = useState(false);
+  const [accountLoginFlow, setAccountLoginFlow] = useState<AccountLoginFlow | null>(
+    null,
+  );
+  const [accountLoginMessage, setAccountLoginMessage] = useState<string | null>(null);
+  const [codexClientRestartMessage, setCodexClientRestartMessage] = useState<
+    string | null
+  >(null);
+  const [restartCodexClientAfterSwitch, setRestartCodexClientAfterSwitch] =
+    useState(() => {
+      if (typeof window === "undefined") {
+        return false;
+      }
+
+      return (
+        window.localStorage.getItem(RESTART_CODEX_CLIENT_AFTER_SWITCH_KEY) ===
+        "true"
+      );
+    });
   const [switchingAccountKey, setSwitchingAccountKey] = useState<string | null>(null);
   const isTauri = isTauriRuntime();
   const deferredQuery = useDeferredValue(query);
@@ -839,6 +986,42 @@ function App() {
     });
   });
 
+  const handleAccountLoginCompleted = useEffectEvent(
+    async (params: AccountLoginCompletedNotification) => {
+      if (params.loginId && accountLoginFlow && accountLoginFlow.loginId !== params.loginId) {
+        return;
+      }
+
+      setIsStartingAccountLogin(false);
+      setAccountLoginFlow((current) => {
+        if (!current || !params.loginId || current.loginId === params.loginId) {
+          return null;
+        }
+
+        return current;
+      });
+
+      if (!params.success) {
+        setAuthError(params.error || "账号登录失败。");
+        setAccountLoginMessage(null);
+        return;
+      }
+
+      setAccountLoginMessage("登录成功，正在保存账号快照...");
+      setAuthError(null);
+
+      try {
+        const registry = await saveCurrentCodexAccount();
+        setAuthRegistry(registry);
+        setLastEvent("account/login/completed");
+        setAccountLoginMessage("登录成功，已添加到账号列表并设为当前账号。");
+        await refreshSnapshot();
+      } catch (error) {
+        setAuthError(formatLocalAccountError(error, "登录成功，但保存账号快照失败。"));
+      }
+    },
+  );
+
   const handleNotification = useEffectEvent((notification: ServerNotification) => {
     startTransition(() => {
       setLastEvent(notification.method);
@@ -848,6 +1031,9 @@ function App() {
     switch (notification.method) {
       case "account/updated":
         void refreshSnapshot();
+        break;
+      case "account/login/completed":
+        void handleAccountLoginCompleted(notification.params);
         break;
       case "account/rateLimits/updated":
         startTransition(() => {
@@ -964,13 +1150,305 @@ function App() {
     },
   );
 
+  const clearFloatingIdleTimers = useEffectEvent(() => {
+    if (dimTimerRef.current !== null) {
+      window.clearTimeout(dimTimerRef.current);
+      dimTimerRef.current = null;
+    }
+
+    if (collapseTimerRef.current !== null) {
+      window.clearTimeout(collapseTimerRef.current);
+      collapseTimerRef.current = null;
+    }
+  });
+
+  const collapseFloatingWindow = useEffectEvent(
+    async (options: { force?: boolean } = {}) => {
+      if (!isTauri || floatingMode === "peek") {
+        return;
+      }
+
+      try {
+        const appWindow = getCurrentWindow();
+        const [position, size, monitors] = await Promise.all([
+          appWindow.outerPosition(),
+          appWindow.outerSize(),
+          availableMonitors(),
+        ]);
+        const monitor = getNearestMonitor(position, size.width, size.height, monitors);
+
+        if (!monitor || (!options.force && !isNearRightDock(position, size.width, monitor))) {
+          return;
+        }
+
+        clearFloatingIdleTimers();
+        lastExpandedWindowRef.current = {
+          position: {
+            x: position.x,
+            y: position.y,
+          },
+          size: {
+            height: size.height,
+            width: size.width,
+          },
+        };
+
+        const peekSize = getPhysicalSizeFromLogical(
+          FLOATING_PEEK_LOGICAL_SIZE,
+          monitor,
+        );
+        const nextPosition = getRightDockPosition(
+          monitor,
+          peekSize.width,
+          peekSize.height,
+          position.y,
+        );
+
+        await appWindow.setMinSize(peekSize);
+        await appWindow.setSize(peekSize);
+        await appWindow.setPosition(nextPosition);
+
+        setFloatingMode("peek");
+        setIsFloatingDimmed(false);
+      } catch {
+        // Floating behavior is an ergonomic layer; connection/status sync should keep working.
+      }
+    },
+  );
+
+  const expandFloatingWindow = useEffectEvent(async () => {
+    if (!isTauri || floatingMode !== "peek") {
+      return;
+    }
+
+    try {
+      clearFloatingIdleTimers();
+      const appWindow = getCurrentWindow();
+      const [position, size, monitors] = await Promise.all([
+        appWindow.outerPosition(),
+        appWindow.outerSize(),
+        availableMonitors(),
+      ]);
+      const snapshot = lastExpandedWindowRef.current;
+      const fallbackSize = snapshot?.size ?? {
+        height: size.height,
+        width: size.width,
+      };
+      const monitor = getNearestMonitor(
+        position,
+        fallbackSize.width,
+        fallbackSize.height,
+        monitors,
+      );
+
+      if (!monitor) {
+        return;
+      }
+
+      const expandedMinSize = getPhysicalSizeFromLogical(
+        FLOATING_EXPANDED_MIN_LOGICAL_SIZE,
+        monitor,
+      );
+      const defaultExpandedSize = getPhysicalSizeFromLogical(
+        FLOATING_DEFAULT_EXPANDED_LOGICAL_SIZE,
+        monitor,
+      );
+      const targetSize = new PhysicalSize(
+        Math.max(snapshot?.size.width ?? defaultExpandedSize.width, expandedMinSize.width),
+        Math.max(
+          snapshot?.size.height ?? defaultExpandedSize.height,
+          expandedMinSize.height,
+        ),
+      );
+      const nextPosition = getRightDockPosition(
+        monitor,
+        targetSize.width,
+        targetSize.height,
+        snapshot?.position.y ?? position.y,
+      );
+
+      await appWindow.setMinSize(expandedMinSize);
+      await appWindow.setSize(targetSize);
+      await appWindow.setPosition(nextPosition);
+
+      setFloatingMode("expanded");
+      setIsFloatingDimmed(false);
+    } catch {
+      setFloatingMode("expanded");
+      setIsFloatingDimmed(false);
+    }
+  });
+
+  const scheduleFloatingIdle = useEffectEvent(() => {
+    if (!isTauri || floatingMode === "peek") {
+      return;
+    }
+
+    clearFloatingIdleTimers();
+    dimTimerRef.current = window.setTimeout(() => {
+      setIsFloatingDimmed(true);
+    }, FLOATING_DIM_DELAY_MS);
+    collapseTimerRef.current = window.setTimeout(() => {
+      void collapseFloatingWindow();
+    }, FLOATING_COLLAPSE_DELAY_MS);
+  });
+
+  const handleFloatingMouseEnter = useEffectEvent(() => {
+    clearFloatingIdleTimers();
+    setIsFloatingDimmed(false);
+
+    if (floatingMode === "peek") {
+      void expandFloatingWindow();
+    }
+  });
+
+  const handleFloatingMouseLeave = useEffectEvent(() => {
+    scheduleFloatingIdle();
+  });
+
+  const handleOpenAccountLoginUrl = useEffectEvent(async (url?: string) => {
+    if (!url) {
+      return;
+    }
+
+    try {
+      await openUrl(url);
+    } catch (error) {
+      setAuthError(getErrorMessage(error, "无法打开登录页面。"));
+    }
+  });
+
+  const handleCopyAccountLoginCode = useEffectEvent(async () => {
+    const code = accountLoginFlow?.userCode;
+    if (!code) {
+      return;
+    }
+
+    try {
+      if (!navigator.clipboard) {
+        throw new Error("当前环境不支持剪贴板。");
+      }
+
+      await navigator.clipboard.writeText(code);
+      setAccountLoginMessage("验证码已复制。");
+    } catch (error) {
+      setAuthError(getErrorMessage(error, "复制验证码失败，请手动复制。"));
+    }
+  });
+
+  const handleStartAccountLogin = useEffectEvent(async () => {
+    if (
+      !isTauri ||
+      isStartingAccountLogin ||
+      accountLoginFlow ||
+      connectionState === "connecting" ||
+      isLaunching
+    ) {
+      return;
+    }
+
+    setIsStartingAccountLogin(true);
+    setAuthError(null);
+    setAccountLoginMessage(null);
+    setCodexClientRestartMessage(null);
+
+    try {
+      if (!clientRef.current || !clientRef.current.isConnected()) {
+        await connectToServer({ launchIfNeeded: true });
+      }
+
+      const client = clientRef.current;
+      if (!client || !client.isConnected()) {
+        throw new Error("Codex app-server 未连接。");
+      }
+
+      const response = await client.startAccountLogin({
+        type: "chatgptDeviceCode",
+      });
+
+      if (response.type === "chatgptDeviceCode") {
+        setAccountLoginFlow({
+          type: "chatgptDeviceCode",
+          loginId: response.loginId,
+          verificationUrl: response.verificationUrl,
+          userCode: response.userCode,
+          startedAt: Date.now(),
+        });
+        setAccountLoginMessage("请在浏览器完成登录，完成后会自动保存到账号列表。");
+        setLastEvent("account/login/started");
+        void handleOpenAccountLoginUrl(response.verificationUrl);
+        return;
+      }
+
+      if (response.type === "chatgpt") {
+        setAccountLoginFlow({
+          type: "chatgpt",
+          loginId: response.loginId,
+          authUrl: response.authUrl,
+          startedAt: Date.now(),
+        });
+        setAccountLoginMessage("请在浏览器完成登录，完成后会自动保存到账号列表。");
+        setLastEvent("account/login/started");
+        void handleOpenAccountLoginUrl(response.authUrl);
+        return;
+      }
+
+      setAccountLoginMessage("登录请求已提交，等待 Codex 返回结果。");
+    } catch (error) {
+      setAuthError(getErrorMessage(error, "启动账号登录失败。"));
+    } finally {
+      setIsStartingAccountLogin(false);
+    }
+  });
+
+  const handleCancelAccountLogin = useEffectEvent(async () => {
+    const flow = accountLoginFlow;
+    const client = clientRef.current;
+
+    if (!flow || !client || !client.isConnected()) {
+      setAccountLoginFlow(null);
+      return;
+    }
+
+    try {
+      await client.cancelAccountLogin(flow.loginId);
+      setAccountLoginFlow(null);
+      setAccountLoginMessage("已取消账号登录。");
+    } catch (error) {
+      setAuthError(getErrorMessage(error, "取消账号登录失败。"));
+    }
+  });
+
+  const handleRestartCodexClient = useEffectEvent(async () => {
+    if (!isTauri || isRestartingCodexClient) {
+      return false;
+    }
+
+    setIsRestartingCodexClient(true);
+    setAuthError(null);
+    setCodexClientRestartMessage(null);
+
+    try {
+      await restartCodexDesktopClient();
+      setCodexClientRestartMessage("已请求重启 Codex 客户端。");
+      setLastEvent("codex-client/restarted");
+      return true;
+    } catch (error) {
+      setAuthError(getErrorMessage(error, "重启 Codex 客户端失败。"));
+      return false;
+    } finally {
+      setIsRestartingCodexClient(false);
+    }
+  });
+
   const handleSwitchAccount = useEffectEvent(async (accountKey: string) => {
-    if (!isTauri || switchingAccountKey) {
+    if (!isTauri || switchingAccountKey || isRestartingCodexClient) {
       return;
     }
 
     setSwitchingAccountKey(accountKey);
     setAuthError(null);
+    setCodexClientRestartMessage(null);
     setLastError(null);
     setRateLimitError(null);
 
@@ -980,6 +1458,14 @@ function App() {
       setAuthRegistry(result.registry);
       setLastEvent("account/switched");
       await connectToServer({ launchIfNeeded: true });
+
+      if (restartCodexClientAfterSwitch) {
+        await handleRestartCodexClient();
+      } else {
+        setCodexClientRestartMessage(
+          "账号已切换；如果 Codex 客户端已经打开，请重启客户端后读取新账号。",
+        );
+      }
     } catch (error) {
       setConnectionState("error");
       setAuthError(formatLocalAccountError(error, "切换账号失败。"));
@@ -989,12 +1475,13 @@ function App() {
   });
 
   const handleSaveCurrentAccount = useEffectEvent(async () => {
-    if (!isTauri || isSavingAccount) {
+    if (!isTauri || isSavingAccount || isStartingAccountLogin) {
       return;
     }
 
     setIsSavingAccount(true);
     setAuthError(null);
+    setAccountLoginMessage(null);
 
     try {
       const registry = await saveCurrentCodexAccount();
@@ -1006,6 +1493,17 @@ function App() {
       setIsSavingAccount(false);
     }
   });
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    window.localStorage.setItem(
+      RESTART_CODEX_CLIENT_AFTER_SWITCH_KEY,
+      String(restartCodexClientAfterSwitch),
+    );
+  }, [restartCodexClientAfterSwitch]);
 
   useEffect(() => {
     if (isTauri) {
@@ -1043,6 +1541,7 @@ function App() {
         snapTimer = window.setTimeout(() => {
           isSnapping = true;
           void snapWindowToScreenEdge(appWindow).finally(() => {
+            scheduleFloatingIdle();
             window.setTimeout(() => {
               isSnapping = false;
             }, SNAP_SETTLE_DELAY_MS);
@@ -1065,7 +1564,20 @@ function App() {
       if (snapTimer !== null) {
         window.clearTimeout(snapTimer);
       }
+      clearFloatingIdleTimers();
       unlistenMoved?.();
+    };
+  }, [isTauri]);
+
+  useEffect(() => {
+    if (!isTauri) {
+      return undefined;
+    }
+
+    scheduleFloatingIdle();
+
+    return () => {
+      clearFloatingIdleTimers();
     };
   }, [isTauri]);
 
@@ -1135,6 +1647,7 @@ function App() {
   const displayedRateLimitError = formatRateLimitError(rateLimitError);
   const authAccounts = authRegistry?.accounts ?? [];
   const activeAuthKey = authRegistry?.active_account_key ?? null;
+  const globalFiveHourUsage = getGlobalFiveHourUsage(rateLimits);
   const threadGroups = (() => {
     if (groupBy === "none") {
       return [{ key: "all", label: "全部任务", threads: visibleThreads }];
@@ -1171,9 +1684,36 @@ function App() {
         return String(left.sortValue).localeCompare(String(right.sortValue), "zh-CN");
       });
   })();
+  const isPeekMode = floatingMode === "peek";
+  const shellClassName = [
+    "shell",
+    `quota-${globalFiveHourUsage.tone}`,
+    `floating-${floatingMode}`,
+    isFloatingDimmed ? "floating-dimmed" : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return (
-    <main className="shell">
+    <main
+      className={shellClassName}
+      onMouseEnter={() => handleFloatingMouseEnter()}
+      onMouseLeave={() => handleFloatingMouseLeave()}
+    >
+      {isPeekMode ? (
+        <button
+          aria-label="展开 Codex 状态浮窗"
+          className={`peek-capsule peek-${globalFiveHourUsage.tone}`}
+          type="button"
+          onClick={() => void expandFloatingWindow()}
+        >
+          <span className="peek-grip" data-tauri-drag-region />
+          <span className="peek-label">5小时</span>
+          <strong>{formatPercent(globalFiveHourUsage.usedPercent)}</strong>
+          <small>{getCompactUsageToneText(globalFiveHourUsage.usedPercent)}</small>
+        </button>
+      ) : (
+        <>
       <header className="topbar" data-tauri-drag-region>
         <div>
           <p className="eyebrow">Codex 状态</p>
@@ -1184,6 +1724,21 @@ function App() {
         </div>
         <div className={`status-pill tone-${connectionState}`}>{connectionBadge}</div>
       </header>
+
+      <aside className={`quota-ribbon quota-ribbon-${globalFiveHourUsage.tone}`}>
+        <div>
+          <span>五小时用量</span>
+          <strong>{formatPercent(globalFiveHourUsage.usedPercent)}</strong>
+        </div>
+        <p>
+          {getUsageToneText(globalFiveHourUsage.usedPercent)}
+          {globalFiveHourUsage.poolLabel ? ` · ${globalFiveHourUsage.poolLabel}` : " · 等待额度数据"}
+          {" · "}
+          {globalFiveHourUsage.resetsAt
+            ? `重置 ${formatResetTime(globalFiveHourUsage.resetsAt)}`
+            : "重置时间暂无"}
+        </p>
+      </aside>
 
       <section className="panel connection-panel">
         <div className="action-row">
@@ -1236,24 +1791,120 @@ function App() {
             <button
               type="button"
               onClick={() => void handleSaveCurrentAccount()}
-              disabled={isSavingAccount || Boolean(switchingAccountKey)}
+              disabled={
+                isSavingAccount ||
+                isStartingAccountLogin ||
+                Boolean(accountLoginFlow) ||
+                Boolean(switchingAccountKey) ||
+                isRestartingCodexClient
+              }
             >
               {isSavingAccount ? "保存中..." : "保存当前账号"}
             </button>
             <button
+              className="primary"
+              type="button"
+              onClick={() => void handleStartAccountLogin()}
+              disabled={
+                !isTauri ||
+                isStartingAccountLogin ||
+                Boolean(accountLoginFlow) ||
+                Boolean(switchingAccountKey) ||
+                isRestartingCodexClient ||
+                connectionState === "connecting" ||
+                isLaunching
+              }
+            >
+              {isStartingAccountLogin ? "启动登录..." : "登录添加账号"}
+            </button>
+            <button
               type="button"
               onClick={() => void loadAuthAccounts()}
-              disabled={isSavingAccount || Boolean(switchingAccountKey)}
+              disabled={
+                isSavingAccount ||
+                isStartingAccountLogin ||
+                Boolean(switchingAccountKey) ||
+                isRestartingCodexClient
+              }
             >
               刷新账号
             </button>
           </div>
 
+          {accountLoginFlow ? (
+            <div className="account-login-box">
+              <div>
+                <strong>等待浏览器登录</strong>
+                <small>登录完成后会自动保存为本地账号快照，并设为当前账号。</small>
+              </div>
+              {accountLoginFlow.userCode ? (
+                <div className="login-code-row">
+                  <span>验证码</span>
+                  <code>{accountLoginFlow.userCode}</code>
+                </div>
+              ) : null}
+              <div className="action-row account-login-actions">
+                <button
+                  type="button"
+                  onClick={() =>
+                    void handleOpenAccountLoginUrl(
+                      accountLoginFlow.verificationUrl ?? accountLoginFlow.authUrl,
+                    )
+                  }
+                  disabled={!accountLoginFlow.verificationUrl && !accountLoginFlow.authUrl}
+                >
+                  打开登录页面
+                </button>
+                {accountLoginFlow.userCode ? (
+                  <button
+                    type="button"
+                    onClick={() => void handleCopyAccountLoginCode()}
+                  >
+                    复制验证码
+                  </button>
+                ) : null}
+                <button type="button" onClick={() => void handleCancelAccountLogin()}>
+                  取消登录
+                </button>
+              </div>
+            </div>
+          ) : null}
+
+          <div className="account-restart-box">
+            <label className="switch-row">
+              <input
+                checked={restartCodexClientAfterSwitch}
+                disabled={Boolean(switchingAccountKey) || isRestartingCodexClient}
+                type="checkbox"
+                onChange={(event) =>
+                  setRestartCodexClientAfterSwitch(event.currentTarget.checked)
+                }
+              />
+              <span>
+                <strong>切换后自动重启 Codex 客户端</strong>
+                <small>
+                  会关闭并重新打开官方 Codex 桌面客户端，让它重新读取当前账号。
+                </small>
+              </span>
+            </label>
+            <button
+              type="button"
+              onClick={() => void handleRestartCodexClient()}
+              disabled={Boolean(switchingAccountKey) || isRestartingCodexClient}
+            >
+              {isRestartingCodexClient ? "重启中..." : "立即重启 Codex 客户端"}
+            </button>
+          </div>
+
           {authError ? <p className="error-text">{authError}</p> : null}
+          {accountLoginMessage ? <p className="hint">{accountLoginMessage}</p> : null}
+          {codexClientRestartMessage ? (
+            <p className="hint">{codexClientRestartMessage}</p>
+          ) : null}
 
           {authAccounts.length === 0 ? (
             <p className="empty-state">
-              暂无已保存账号。先用官方 Codex 登录一次，再点击“保存当前账号”。
+              暂无已保存账号。点击“登录添加账号”完成登录，或先用官方 Codex 登录一次再保存当前账号。
             </p>
           ) : (
             <div className="account-list">
@@ -1277,7 +1928,11 @@ function App() {
                       <button
                         type="button"
                         className="chip"
-                        disabled={Boolean(switchingAccountKey) || isSavingAccount}
+                        disabled={
+                          Boolean(switchingAccountKey) ||
+                          isSavingAccount ||
+                          isRestartingCodexClient
+                        }
                         onClick={() => void handleSwitchAccount(authAccount.account_key)}
                       >
                         {isSwitching ? "切换中..." : "切换"}
@@ -1290,7 +1945,7 @@ function App() {
           )}
 
           <p className="hint">
-            账号切换由本应用本地完成：备份当前 auth.json，替换为目标账号快照，然后重启 Codex app-server。
+            登录添加账号会调用 Codex app-server 官方登录流程；账号切换由本应用本地完成：备份当前 auth.json，替换为目标账号快照，然后重启 Codex app-server。
           </p>
         </section>
       ) : null}
@@ -1517,10 +2172,6 @@ function App() {
                         </div>
                       ) : null}
 
-                      <p className="thread-preview">
-                        {thread.preview || "暂无预览内容。"}
-                      </p>
-
                       {isEditingBoard ? (
                         <div className="thread-board-editor">
                           <label>
@@ -1621,6 +2272,8 @@ function App() {
         <p className="event-line">最近事件：{formatEventName(lastEvent)}</p>
         </section>
       ) : null}
+        </>
+      )}
     </main>
   );
 }

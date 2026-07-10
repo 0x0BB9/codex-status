@@ -40,12 +40,29 @@ body {
   background: transparent;
 }
 
+body:has(.floating-peek) {
+  min-width: 0;
+  min-height: 0;
+}
+
 #root {
   min-height: 100vh;
   background:
     radial-gradient(circle at 18% 0%, rgba(223, 140, 61, 0.18), transparent 34%),
     rgba(16, 19, 17, 0.84);
   backdrop-filter: blur(18px);
+}
+
+#root:has(.floating-dimmed:not(.floating-peek)) {
+  background:
+    radial-gradient(circle at 18% 0%, rgba(223, 140, 61, 0.08), transparent 32%),
+    rgba(16, 19, 17, 0.36);
+  backdrop-filter: blur(8px);
+}
+
+#root:has(.floating-peek) {
+  background: transparent;
+  backdrop-filter: none;
 }
 
 button,
@@ -115,6 +132,157 @@ code {
   flex-direction: column;
   gap: 0.75rem;
   color: var(--text-main);
+  background:
+    radial-gradient(circle at 16% 0%, rgba(223, 140, 61, 0.13), transparent 34%),
+    transparent;
+  transition:
+    background 180ms ease,
+    box-shadow 180ms ease,
+    opacity 180ms ease,
+    transform 180ms ease;
+}
+
+.shell.floating-expanded.floating-dimmed {
+  opacity: 0.48;
+  transform: translateX(6px);
+}
+
+.shell.floating-peek {
+  min-height: 100vh;
+  display: grid;
+  place-items: stretch;
+  gap: 0;
+  overflow: hidden;
+  padding: 0.3rem;
+  background: transparent;
+  box-shadow: none;
+}
+
+.shell.quota-safe {
+  background:
+    radial-gradient(circle at 16% 0%, rgba(114, 215, 140, 0.16), transparent 34%),
+    linear-gradient(180deg, rgba(114, 215, 140, 0.05), transparent 42%);
+  box-shadow: inset 0 0 0 1px rgba(114, 215, 140, 0.08);
+}
+
+.shell.quota-warning {
+  background:
+    radial-gradient(circle at 14% 0%, rgba(242, 180, 84, 0.32), transparent 38%),
+    linear-gradient(180deg, rgba(242, 180, 84, 0.12), transparent 48%);
+  box-shadow: inset 0 0 0 1px rgba(242, 180, 84, 0.18);
+}
+
+.shell.quota-danger {
+  background:
+    radial-gradient(circle at 14% 0%, rgba(255, 116, 106, 0.42), transparent 40%),
+    linear-gradient(180deg, rgba(255, 116, 106, 0.16), transparent 52%);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 116, 106, 0.28),
+    inset 0 0 44px rgba(255, 116, 106, 0.09);
+}
+
+.shell.quota-unknown {
+  background:
+    radial-gradient(circle at 16% 0%, rgba(255, 255, 255, 0.09), transparent 34%),
+    transparent;
+}
+
+.peek-capsule {
+  display: grid;
+  grid-template-rows: auto auto 1fr auto;
+  align-items: center;
+  justify-items: center;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  padding: 0.45rem 0.2rem 0.55rem;
+  color: var(--text-main);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.08), transparent 34%),
+    rgba(13, 16, 14, 0.92);
+  box-shadow:
+    0 10px 28px rgba(0, 0, 0, 0.34),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+  cursor: pointer;
+}
+
+.peek-capsule:hover {
+  transform: translateX(-2px);
+}
+
+.peek-grip {
+  width: 24px;
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.peek-label {
+  margin-top: 0.35rem;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.peek-capsule strong {
+  font-size: 1.18rem;
+  line-height: 1;
+}
+
+.peek-capsule small {
+  align-self: end;
+  border-radius: 999px;
+  padding: 0.12rem 0.34rem;
+  font-size: 0.68rem;
+  font-weight: 700;
+}
+
+.peek-safe {
+  border-color: rgba(114, 215, 140, 0.45);
+  background:
+    linear-gradient(180deg, rgba(114, 215, 140, 0.18), transparent 42%),
+    rgba(10, 17, 12, 0.94);
+}
+
+.peek-safe strong,
+.peek-safe small {
+  color: var(--ok);
+}
+
+.peek-warning {
+  border-color: rgba(242, 180, 84, 0.78);
+  background:
+    linear-gradient(180deg, rgba(242, 180, 84, 0.24), transparent 46%),
+    rgba(18, 15, 8, 0.95);
+}
+
+.peek-warning strong,
+.peek-warning small {
+  color: var(--warn);
+}
+
+.peek-danger {
+  border-color: rgba(255, 116, 106, 0.92);
+  background:
+    linear-gradient(180deg, rgba(255, 116, 106, 0.28), transparent 48%),
+    rgba(20, 9, 8, 0.96);
+  box-shadow:
+    0 10px 28px rgba(0, 0, 0, 0.34),
+    0 0 24px rgba(255, 116, 106, 0.22),
+    inset 0 0 0 1px rgba(255, 116, 106, 0.18);
+}
+
+.peek-danger strong,
+.peek-danger small {
+  color: var(--danger);
+}
+
+.peek-unknown strong,
+.peek-unknown small {
+  color: var(--text-muted);
 }
 
 .topbar,
@@ -136,6 +304,76 @@ code {
   padding: 0.25rem 0.1rem;
   cursor: move;
   user-select: none;
+}
+
+.quota-ribbon {
+  position: sticky;
+  top: 0.5rem;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.55rem 0.65rem;
+  background: rgba(13, 16, 14, 0.9);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.26);
+  backdrop-filter: blur(14px);
+}
+
+.quota-ribbon div {
+  display: grid;
+  gap: 0.08rem;
+}
+
+.quota-ribbon span,
+.quota-ribbon p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.76rem;
+}
+
+.quota-ribbon strong {
+  font-size: 1.35rem;
+  line-height: 1;
+}
+
+.quota-ribbon-safe {
+  border-color: rgba(114, 215, 140, 0.34);
+  background:
+    linear-gradient(90deg, rgba(114, 215, 140, 0.12), transparent 58%),
+    rgba(13, 16, 14, 0.9);
+}
+
+.quota-ribbon-safe strong {
+  color: var(--ok);
+}
+
+.quota-ribbon-warning {
+  border-color: rgba(242, 180, 84, 0.62);
+  background:
+    linear-gradient(90deg, rgba(242, 180, 84, 0.2), transparent 58%),
+    rgba(17, 18, 13, 0.92);
+}
+
+.quota-ribbon-warning strong {
+  color: var(--warn);
+}
+
+.quota-ribbon-danger {
+  border-color: rgba(255, 116, 106, 0.82);
+  background:
+    linear-gradient(90deg, rgba(255, 116, 106, 0.24), transparent 60%),
+    rgba(18, 12, 11, 0.94);
+  box-shadow:
+    0 10px 24px rgba(0, 0, 0, 0.32),
+    0 0 0 1px rgba(255, 116, 106, 0.14),
+    0 0 24px rgba(255, 116, 106, 0.18);
+}
+
+.quota-ribbon-danger strong {
+  color: var(--danger);
 }
 
 .topbar h1,
@@ -170,7 +408,6 @@ code {
 .section-note,
 .hint,
 .thread-meta,
-.thread-preview,
 .meter-note,
 .usage-card p,
 .empty-state,
@@ -202,6 +439,107 @@ code {
 
 .account-actions {
   margin-bottom: 0.7rem;
+}
+
+.account-login-box,
+.account-restart-box {
+  display: grid;
+  gap: 0.55rem;
+  margin-bottom: 0.7rem;
+  border-radius: 8px;
+  padding: 0.7rem;
+}
+
+.account-login-box {
+  border: 1px solid rgba(88, 181, 165, 0.28);
+  background:
+    linear-gradient(135deg, rgba(88, 181, 165, 0.12), transparent 58%),
+    rgba(13, 16, 14, 0.76);
+}
+
+.account-restart-box {
+  border: 1px solid rgba(242, 180, 84, 0.24);
+  background:
+    linear-gradient(135deg, rgba(242, 180, 84, 0.08), transparent 52%),
+    rgba(13, 16, 14, 0.72);
+}
+
+.account-login-box > div:first-child {
+  display: grid;
+  gap: 0.12rem;
+}
+
+.account-login-box strong {
+  color: var(--text-main);
+  font-size: 0.86rem;
+}
+
+.account-login-box small {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.login-code-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  border: 1px solid rgba(88, 181, 165, 0.22);
+  border-radius: 7px;
+  padding: 0.55rem 0.65rem;
+  background: rgba(4, 9, 8, 0.42);
+}
+
+.login-code-row span {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+.login-code-row code {
+  color: var(--accent-soft);
+  font-size: 1rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.account-login-actions {
+  gap: 0.45rem;
+}
+
+.account-restart-box button {
+  justify-self: flex-start;
+}
+
+.switch-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  color: var(--text-muted);
+}
+
+.switch-row input {
+  width: auto;
+  min-height: auto;
+  margin: 0.2rem 0 0;
+  accent-color: var(--accent);
+}
+
+.switch-row strong,
+.switch-row small {
+  display: block;
+}
+
+.switch-row strong {
+  color: var(--text-main);
+  font-size: 0.86rem;
+}
+
+.switch-row small {
+  margin-top: 0.12rem;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  line-height: 1.35;
 }
 
 .error-text {
@@ -296,7 +634,6 @@ code {
 
 .usage-header p,
 .thread-meta,
-.thread-preview,
 .usage-footer,
 .meter-note,
 .empty-state {
@@ -513,10 +850,6 @@ code {
 .thread-not-loaded::before,
 .thread-muted::before {
   background: rgba(255, 255, 255, 0.18);
-}
-
-.thread-preview {
-  line-height: 1.45;
 }
 
 .thread-actions {

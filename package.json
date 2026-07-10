@@ -9,7 +9,13 @@
     "preview": "vite preview",
     "protocol:generate": "codex app-server generate-ts --out src/generated",
     "server:listen": "codex app-server --listen ws://127.0.0.1:48123",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "tauri:build": "tauri build",
+    "tauri:build:debug": "tauri build --debug",
+    "tauri:dev": "tauri dev",
+    "mac:sign:adhoc": "codesign --force --deep --sign - 'src-tauri/target/release/bundle/macos/Codex Status Floater.app'",
+    "mac:dmg:adhoc": "hdiutil create -volname 'Codex Status Floater' -srcfolder 'src-tauri/target/release/bundle/macos/Codex Status Floater.app' -ov -format UDZO 'src-tauri/target/release/bundle/dmg/Codex Status Floater_0.1.0_aarch64_adhoc.dmg'",
+    "mac:package:adhoc": "pnpm tauri:build && pnpm mac:sign:adhoc && pnpm mac:dmg:adhoc"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

@@ -16,6 +16,7 @@ It reads data from the official `codex app-server` surface and is designed to st
 - local task board metadata: pinned threads, notes, project, priority, and stage
 - live status notifications such as `thread/status/changed`
 - tray menu controls, `Option + Space` global toggle, transparent floating, and edge snapping
+- right-edge auto-collapse into a small 5-hour usage capsule with hover-to-expand
 - a tiny local server log when the app launches `codex app-server` itself
 
 ## Account Switching
@@ -24,8 +25,10 @@ The app implements local account switching itself. It does not require `codex-au
 
 - Saved accounts live under `~/.codex/accounts/`.
 - The active account is still the standard `~/.codex/auth.json` used by Codex.
+- Clicking "登录添加账号" starts the official Codex app-server login flow, then saves the completed auth as a local snapshot.
 - Clicking "保存当前账号" stores the currently logged-in Codex auth as a local snapshot.
 - Clicking "切换" backs up the current `auth.json`, replaces it with the selected snapshot, and restarts this app's local `codex app-server`.
+- The account panel can also restart the official macOS Codex desktop client after switching, or on demand through "立即重启 Codex 客户端".
 
 See [docs/account-switching.md](docs/account-switching.md) for the full file layout, switching flow, backups, compatibility notes, and limitations.
 
@@ -38,6 +41,10 @@ Task board annotations are local-only and do not modify Codex thread state.
 - Classify threads by project, priority, and stage, then group the board by those fields.
 
 See [docs/thread-board.md](docs/thread-board.md) for the storage location and field details.
+
+## Distribution
+
+For packaging and sharing the app with other users, see [docs/distribution.md](docs/distribution.md).
 
 ## Local Web Preview
 
@@ -65,8 +72,9 @@ The Tauri shell is configured to:
 - expose a macOS menu bar tray icon for show/hide and quit
 - toggle the window globally with `Option + Space`
 - snap to screen edges after dragging near a boundary
+- dim after idle and collapse into a right-edge capsule when docked to the screen edge
 - appear as a narrow side utility window
-- launch `codex app-server` over stdio through the shell plugin
+- launch `codex app-server` over stdio, preferring the official Codex.app bundled binary before falling back to shell `codex`
 - manage local Codex account snapshots through Tauri commands
 
 ## Build Notes

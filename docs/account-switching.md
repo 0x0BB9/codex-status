@@ -24,6 +24,18 @@
 - `~/.codex/accounts/registry.json` 是账号索引，记录当前激活账号和账号展示信息。
 - `~/.codex/accounts/auth.json.bak.<timestamp>` 是切换账号前自动生成的备份。
 
+## 登录添加账号
+
+点击“登录添加账号”后：
+
+1. 工具通过 Codex app-server 调用官方登录流程。
+2. 浏览器会打开 Codex 登录页面；如果返回设备码，浮窗会同时显示验证码。
+3. 登录完成后，Codex 会写入当前 `~/.codex/auth.json`。
+4. 浮窗收到 `account/login/completed` 通知后，会读取新的 `auth.json`。
+5. 工具会把完整认证内容保存为 `accounts/<base64url(account_key)>.auth.json`，并更新 `registry.json`。
+
+这个流程不依赖 `codex-auth`，也不会在本应用里复刻 OAuth token exchange。
+
 ## 保存当前账号
 
 1. 先用官方 Codex 完成登录，让 Codex 写入当前 `~/.codex/auth.json`。
@@ -44,7 +56,11 @@
 4. 工具更新 `registry.json` 的 `active_account_key` 和 `last_used_at`。
 5. 浮窗重启自己的 `codex app-server`，让新账号立即生效。
 
-已经运行中的其他 Codex CLI、Codex App 或 VS Code 扩展不会自动切换账号；它们通常需要重启或重新连接后才会读取新的 `auth.json`。
+如果打开了“切换后自动重启 Codex 客户端”，工具还会在切换成功后重启官方 Codex 桌面客户端。也可以在账号面板里点击“立即重启 Codex 客户端”手动触发。
+
+桌面客户端重启只针对 macOS 上 bundle id 为 `com.openai.codex` 的官方 Codex App。实现方式是先请求 Codex 正常退出，如果失败则用 `pkill -TERM -x Codex` 兜底，然后通过 `open -b com.openai.codex` 重新打开。
+
+已经运行中的其他 Codex CLI 或 VS Code 扩展不会自动切换账号；它们通常需要重启或重新连接后才会读取新的 `auth.json`。
 
 ## 兼容性
 
@@ -58,8 +74,8 @@
 
 ## 限制
 
-- 这个工具不实现 OAuth 登录流程。
-- 新增账号仍需要先通过官方 Codex 登录一次。
+- 这个工具调用 Codex app-server 的官方登录流程，不直接实现 OAuth token exchange。
 - 工具只管理本机文件，不跨设备同步账号。
 - 认证文件包含敏感 token，不要把 `~/.codex/accounts` 提交到 Git 或发给别人。
+- 重启官方 Codex 桌面客户端会关闭当前 Codex App 窗口；正在进行的客户端会话可能需要重新打开。
 - 删除账号、编辑别名、导入外部 auth 文件还没有做成 UI。
