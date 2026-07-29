@@ -32,7 +32,9 @@ type CodexAppServerShellClientOptions = {
 const RPC_TIMEOUT_MS = 8_000;
 const ZSH_CODEX_APP_SERVER_SCRIPT =
   'source "$HOME/.zshrc" >/dev/null 2>&1; exec codex app-server';
-const COMMANDS = [
+const POWERSHELL_CODEX_APP_SERVER_SCRIPT =
+  "$paths = @((Join-Path $env:LOCALAPPDATA 'Programs\\Codex\\resources\\codex.exe'), (Join-Path $env:LOCALAPPDATA 'Programs\\ChatGPT\\resources\\codex.exe')) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }; $codex = $paths | Select-Object -First 1; if (-not $codex) { $codex = Get-AppxPackage | Where-Object { $_.Name -match 'OpenAI|ChatGPT|Codex' } | ForEach-Object { Get-ChildItem -LiteralPath $_.InstallLocation -Filter codex.exe -File -Recurse -ErrorAction SilentlyContinue } | Select-Object -First 1 -ExpandProperty FullName }; if (-not $codex) { Write-Error 'Unable to locate codex.exe in the Windows desktop app.'; exit 127 }; & $codex app-server; exit $LASTEXITCODE";
+const MACOS_COMMANDS = [
   {
     args: ["app-server"],
     name: "codex-app-server-bundled",
@@ -45,11 +47,35 @@ const COMMANDS = [
     args: ["-lc", ZSH_CODEX_APP_SERVER_SCRIPT],
     name: "codex-app-server-zsh-login",
   },
+] as const;
+const WINDOWS_COMMANDS = [
+  {
+    args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", POWERSHELL_CODEX_APP_SERVER_SCRIPT],
+    name: "codex-app-server-windows-bundled",
+  },
+  {
+    args: ["/D", "/S", "/C", "codex app-server"],
+    name: "codex-app-server-windows-path",
+  },
+] as const;
+const PATH_COMMAND = [
   {
     args: ["app-server"],
     name: "codex-app-server",
   },
 ] as const;
+
+function getAppServerCommands() {
+  if (navigator.userAgent.includes("Windows")) {
+    return [...WINDOWS_COMMANDS, ...PATH_COMMAND];
+  }
+
+  if (navigator.userAgent.includes("Macintosh")) {
+    return [...MACOS_COMMANDS, ...PATH_COMMAND];
+  }
+
+  return [...PATH_COMMAND];
+}
 
 export function isTauriRuntime() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -98,7 +124,7 @@ export class CodexAppServerShellClient {
     const { Command } = await import("@tauri-apps/plugin-shell");
     const errors: string[] = [];
 
-    for (const commandConfig of COMMANDS) {
+    for (const commandConfig of getAppServerCommands()) {
       try {
         const command = Command.create(commandConfig.name, [...commandConfig.args]);
 
@@ -154,8 +180,8 @@ export class CodexAppServerShellClient {
     return this.child !== null;
   }
 
-  getAccount() {
-    return this.request<GetAccountResponse>("account/read", { refreshToken: false });
+  getAccount(refreshToken = false) {
+    return this.request<GetAccountResponse>("account/read", { refreshToken });
   }
 
   getRateLimits() {

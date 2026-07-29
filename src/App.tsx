@@ -62,7 +62,7 @@ type DashboardClient = {
   cancelAccountLogin: (loginId: string) => Promise<unknown>;
   connect: (target: string) => Promise<unknown>;
   disconnect: (reason?: string) => void;
-  getAccount: () => Promise<{ account: Account | null }>;
+  getAccount: (refreshToken?: boolean) => Promise<{ account: Account | null }>;
   getRateLimits: () => Promise<GetAccountRateLimitsResponse>;
   isConnected: () => boolean;
   listThreads: (params: {
@@ -172,16 +172,19 @@ function getUsageTone(value: number | null | undefined) {
   return "safe";
 }
 
-function getUsageToneText(value: number | null | undefined) {
+function getUsageToneText(
+  value: number | null | undefined,
+  label = "短周期用量",
+) {
   switch (getUsageTone(value)) {
     case "danger":
-      return "五小时用量紧张";
+      return `${label}紧张`;
     case "warning":
-      return "五小时用量偏高";
+      return `${label}偏高`;
     case "safe":
-      return "五小时用量正常";
+      return `${label}正常`;
     default:
-      return "五小时用量未知";
+      return `${label}未知`;
   }
 }
 
@@ -198,7 +201,70 @@ function getCompactUsageToneText(value: number | null | undefined) {
   }
 }
 
-function getGlobalFiveHourUsage(rateLimits: RateLimitSnapshot[]) {
+function formatRateLimitWindowSummaryLabel(
+  window: { windowDurationMins: number | null } | null | undefined,
+  fallback = "短周期用量",
+) {
+  const durationMins = window?.windowDurationMins;
+  if (!durationMins) {
+    return fallback;
+  }
+
+  if (durationMins === 300) {
+    return "五小时用量";
+  }
+
+  if (durationMins === 10_080) {
+    return "一周用量";
+  }
+
+  if (durationMins % 10_080 === 0) {
+    return `${durationMins / 10_080} 周用量`;
+  }
+
+  if (durationMins % 1_440 === 0) {
+    return `${durationMins / 1_440} 天用量`;
+  }
+
+  if (durationMins % 60 === 0) {
+    return `${durationMins / 60} 小时用量`;
+  }
+
+  return `${durationMins} 分钟用量`;
+}
+
+function formatRateLimitWindowCompactLabel(
+  window: { windowDurationMins: number | null } | null | undefined,
+) {
+  const durationMins = window?.windowDurationMins;
+  if (!durationMins) {
+    return "短周期";
+  }
+
+  if (durationMins === 300) {
+    return "5小时";
+  }
+
+  if (durationMins === 10_080) {
+    return "1周";
+  }
+
+  if (durationMins % 10_080 === 0) {
+    return `${durationMins / 10_080}周`;
+  }
+
+  if (durationMins % 1_440 === 0) {
+    return `${durationMins / 1_440}天`;
+  }
+
+  if (durationMins % 60 === 0) {
+    return `${durationMins / 60}小时`;
+  }
+
+  return `${durationMins}分钟`;
+}
+
+function getGlobalPrimaryUsage(rateLimits: RateLimitSnapshot[]) {
   const primaryWindows = rateLimits
     .map((snapshot) => ({
       poolLabel: snapshot.limitName ?? snapshot.limitId ?? "默认额度池",
@@ -221,11 +287,14 @@ function getGlobalFiveHourUsage(rateLimits: RateLimitSnapshot[]) {
     },
     null,
   );
-  const usedPercent = tightest?.window?.usedPercent ?? null;
+  const selectedWindow = tightest?.window ?? null;
+  const usedPercent = selectedWindow?.usedPercent ?? null;
 
   return {
+    compactLabel: formatRateLimitWindowCompactLabel(selectedWindow),
+    label: formatRateLimitWindowSummaryLabel(selectedWindow),
     poolLabel: tightest?.poolLabel ?? null,
-    resetsAt: tightest?.window?.resetsAt ?? null,
+    resetsAt: selectedWindow?.resetsAt ?? null,
     tone: getUsageTone(usedPercent),
     usedPercent,
   };
@@ -537,6 +606,10 @@ function formatEventName(method: string) {
       return "用量已更新";
     case "account/switched":
       return "账号已切换";
+    case "account/switch-verified":
+      return "账号切换已验证";
+    case "account/switch-rolled-back":
+      return "账号切换已回滚";
     case "account/saved":
       return "当前账号已保存";
     case "account/login/completed":
@@ -831,13 +904,13 @@ function App() {
   const [restartCodexClientAfterSwitch, setRestartCodexClientAfterSwitch] =
     useState(() => {
       if (typeof window === "undefined") {
-        return false;
+        return true;
       }
 
-      return (
-        window.localStorage.getItem(RESTART_CODEX_CLIENT_AFTER_SWITCH_KEY) ===
-        "true"
+      const storedValue = window.localStorage.getItem(
+        RESTART_CODEX_CLIENT_AFTER_SWITCH_KEY,
       );
+      return storedValue === null ? true : storedValue === "true";
     });
   const [switchingAccountKey, setSwitchingAccountKey] = useState<string | null>(null);
   const isTauri = isTauriRuntime();
@@ -986,6 +1059,28 @@ function App() {
     });
   });
 
+  const handleRestartCodexClient = useEffectEvent(async () => {
+    if (!isTauri || isRestartingCodexClient) {
+      return false;
+    }
+
+    setIsRestartingCodexClient(true);
+    setAuthError(null);
+    setCodexClientRestartMessage(null);
+
+    try {
+      await restartCodexDesktopClient();
+      setCodexClientRestartMessage("已请求重启 Codex 客户端。");
+      setLastEvent("codex-client/restarted");
+      return true;
+    } catch (error) {
+      setAuthError(getErrorMessage(error, "重启 Codex 客户端失败。"));
+      return false;
+    } finally {
+      setIsRestartingCodexClient(false);
+    }
+  });
+
   const handleAccountLoginCompleted = useEffectEvent(
     async (params: AccountLoginCompletedNotification) => {
       if (params.loginId && accountLoginFlow && accountLoginFlow.loginId !== params.loginId) {
@@ -1016,6 +1111,19 @@ function App() {
         setLastEvent("account/login/completed");
         setAccountLoginMessage("登录成功，已添加到账号列表并设为当前账号。");
         await refreshSnapshot();
+
+        if (restartCodexClientAfterSwitch) {
+          const restarted = await handleRestartCodexClient();
+          if (restarted) {
+            setCodexClientRestartMessage(
+              "新账号已保存，已重启官方客户端。新版 ChatGPT 客户端如使用独立会话，可能仍需在客户端内确认账号。",
+            );
+          }
+        } else {
+          setCodexClientRestartMessage(
+            "新账号已在浮窗和 CLI 中生效；官方桌面客户端尚未重启。",
+          );
+        }
       } catch (error) {
         setAuthError(formatLocalAccountError(error, "登录成功，但保存账号快照失败。"));
       }
@@ -1362,9 +1470,38 @@ function App() {
         throw new Error("Codex app-server 未连接。");
       }
 
-      const response = await client.startAccountLogin({
-        type: "chatgptDeviceCode",
-      });
+      const currentAccount = await client.getAccount();
+      if (currentAccount.account) {
+        const registry = await saveCurrentCodexAccount();
+        setAuthRegistry(registry);
+      }
+
+      let response: LoginAccountResponse;
+      try {
+        response = await client.startAccountLogin({
+          type: "chatgpt",
+        });
+      } catch (browserLoginError) {
+        const browserLoginMessage = getErrorMessage(
+          browserLoginError,
+          "浏览器登录启动失败。",
+        );
+        appendServerLog(`Browser login unavailable: ${browserLoginMessage}`);
+
+        try {
+          response = await client.startAccountLogin({
+            type: "chatgptDeviceCode",
+          });
+        } catch (deviceLoginError) {
+          const deviceLoginMessage = getErrorMessage(
+            deviceLoginError,
+            "设备码登录启动失败。",
+          );
+          throw new Error(
+            `浏览器登录启动失败：${browserLoginMessage}；设备码登录也不可用：${deviceLoginMessage}`,
+          );
+        }
+      }
 
       if (response.type === "chatgptDeviceCode") {
         setAccountLoginFlow({
@@ -1387,7 +1524,9 @@ function App() {
           authUrl: response.authUrl,
           startedAt: Date.now(),
         });
-        setAccountLoginMessage("请在浏览器完成登录，完成后会自动保存到账号列表。");
+        setAccountLoginMessage(
+          "请在浏览器选择要添加的 ChatGPT 账号；完成后会自动保存到账号列表。",
+        );
         setLastEvent("account/login/started");
         void handleOpenAccountLoginUrl(response.authUrl);
         return;
@@ -1419,56 +1558,120 @@ function App() {
     }
   });
 
-  const handleRestartCodexClient = useEffectEvent(async () => {
-    if (!isTauri || isRestartingCodexClient) {
-      return false;
-    }
-
-    setIsRestartingCodexClient(true);
-    setAuthError(null);
-    setCodexClientRestartMessage(null);
-
-    try {
-      await restartCodexDesktopClient();
-      setCodexClientRestartMessage("已请求重启 Codex 客户端。");
-      setLastEvent("codex-client/restarted");
-      return true;
-    } catch (error) {
-      setAuthError(getErrorMessage(error, "重启 Codex 客户端失败。"));
-      return false;
-    } finally {
-      setIsRestartingCodexClient(false);
-    }
-  });
-
   const handleSwitchAccount = useEffectEvent(async (accountKey: string) => {
     if (!isTauri || switchingAccountKey || isRestartingCodexClient) {
       return;
     }
 
+    const previousAccountKey = authRegistry?.active_account_key ?? null;
+    let accountWasReplaced = false;
     setSwitchingAccountKey(accountKey);
     setAuthError(null);
     setCodexClientRestartMessage(null);
+    setAccountLoginMessage("正在切换并验证账号...");
     setLastError(null);
     setRateLimitError(null);
 
     try {
       await disconnectClient("Reconnecting");
       const result = await switchLocalCodexAccount(accountKey);
+      accountWasReplaced = true;
       setAuthRegistry(result.registry);
       setLastEvent("account/switched");
       await connectToServer({ launchIfNeeded: true });
 
+      const client = clientRef.current;
+      if (!client || !client.isConnected()) {
+        throw new Error("切换后无法连接 Codex app-server，目标账号尚未验证。");
+      }
+
+      const accountResult = await client.getAccount(true);
+      if (!accountResult.account) {
+        throw new Error("目标账号认证已失效，请重新登录并添加该账号。");
+      }
+
+      const verifiedRegistry = await saveCurrentCodexAccount();
+      if (verifiedRegistry.active_account_key !== accountKey) {
+        throw new Error("切换后的账号与目标账号不一致，已停止继续切换。");
+      }
+
+      setAuthRegistry(verifiedRegistry);
+      setAccount(accountResult.account);
+      setLastEvent("account/switch-verified");
+      setAccountLoginMessage("账号已切换，认证验证成功。");
+      await refreshSnapshot();
+
       if (restartCodexClientAfterSwitch) {
-        await handleRestartCodexClient();
+        const restarted = await handleRestartCodexClient();
+        if (restarted) {
+          setCodexClientRestartMessage(
+            "已重启官方客户端。浮窗和 CLI 已切换；新版 ChatGPT 客户端如使用独立会话，可能仍需在客户端内确认账号。",
+          );
+        }
       } else {
         setCodexClientRestartMessage(
-          "账号已切换；如果 Codex 客户端已经打开，请重启客户端后读取新账号。",
+          "浮窗和 CLI 已完成账号切换；官方桌面客户端尚未重启。",
         );
       }
     } catch (error) {
-      setConnectionState("error");
-      setAuthError(formatLocalAccountError(error, "切换账号失败。"));
+      const switchError = formatLocalAccountError(error, "切换账号失败。");
+      let rollbackError: string | null = null;
+      let rollbackSucceeded = false;
+
+      if (
+        accountWasReplaced &&
+        previousAccountKey &&
+        previousAccountKey !== accountKey
+      ) {
+        setAccountLoginMessage("目标账号验证失败，正在恢复原账号...");
+
+        try {
+          await disconnectClient("Reconnecting");
+          const rollbackResult = await switchLocalCodexAccount(previousAccountKey);
+          setAuthRegistry(rollbackResult.registry);
+          await connectToServer({ launchIfNeeded: true });
+
+          const rollbackClient = clientRef.current;
+          if (!rollbackClient || !rollbackClient.isConnected()) {
+            throw new Error("恢复后无法连接 Codex app-server。");
+          }
+
+          const rollbackAccount = await rollbackClient.getAccount(true);
+          if (!rollbackAccount.account) {
+            throw new Error("原账号认证也已失效。");
+          }
+
+          const restoredRegistry = await saveCurrentCodexAccount();
+          if (restoredRegistry.active_account_key !== previousAccountKey) {
+            throw new Error("恢复后的账号与原账号不一致。");
+          }
+
+          setAuthRegistry(restoredRegistry);
+          setAccount(rollbackAccount.account);
+          setLastEvent("account/switch-rolled-back");
+          setAccountLoginMessage("目标账号验证失败，已自动恢复原账号。");
+          await refreshSnapshot();
+          rollbackSucceeded = true;
+        } catch (rollbackFailure) {
+          rollbackError = formatLocalAccountError(
+            rollbackFailure,
+            "自动恢复原账号失败。",
+          );
+        }
+      }
+
+      if (!rollbackSucceeded) {
+        setConnectionState("error");
+        setAccountLoginMessage(null);
+      }
+
+      setAuthError(
+        rollbackError
+          ? `${switchError} 自动恢复原账号也失败：${rollbackError}`
+          : rollbackSucceeded
+            ? `${switchError} 已自动恢复原账号。`
+            : switchError,
+      );
     } finally {
       setSwitchingAccountKey(null);
     }
@@ -1647,7 +1850,7 @@ function App() {
   const displayedRateLimitError = formatRateLimitError(rateLimitError);
   const authAccounts = authRegistry?.accounts ?? [];
   const activeAuthKey = authRegistry?.active_account_key ?? null;
-  const globalFiveHourUsage = getGlobalFiveHourUsage(rateLimits);
+  const globalPrimaryUsage = getGlobalPrimaryUsage(rateLimits);
   const threadGroups = (() => {
     if (groupBy === "none") {
       return [{ key: "all", label: "全部任务", threads: visibleThreads }];
@@ -1687,7 +1890,7 @@ function App() {
   const isPeekMode = floatingMode === "peek";
   const shellClassName = [
     "shell",
-    `quota-${globalFiveHourUsage.tone}`,
+    `quota-${globalPrimaryUsage.tone}`,
     `floating-${floatingMode}`,
     isFloatingDimmed ? "floating-dimmed" : null,
   ]
@@ -1703,14 +1906,14 @@ function App() {
       {isPeekMode ? (
         <button
           aria-label="展开 Codex 状态浮窗"
-          className={`peek-capsule peek-${globalFiveHourUsage.tone}`}
+          className={`peek-capsule peek-${globalPrimaryUsage.tone}`}
           type="button"
           onClick={() => void expandFloatingWindow()}
         >
           <span className="peek-grip" data-tauri-drag-region />
-          <span className="peek-label">5小时</span>
-          <strong>{formatPercent(globalFiveHourUsage.usedPercent)}</strong>
-          <small>{getCompactUsageToneText(globalFiveHourUsage.usedPercent)}</small>
+          <span className="peek-label">{globalPrimaryUsage.compactLabel}</span>
+          <strong>{formatPercent(globalPrimaryUsage.usedPercent)}</strong>
+          <small>{getCompactUsageToneText(globalPrimaryUsage.usedPercent)}</small>
         </button>
       ) : (
         <>
@@ -1725,17 +1928,17 @@ function App() {
         <div className={`status-pill tone-${connectionState}`}>{connectionBadge}</div>
       </header>
 
-      <aside className={`quota-ribbon quota-ribbon-${globalFiveHourUsage.tone}`}>
+      <aside className={`quota-ribbon quota-ribbon-${globalPrimaryUsage.tone}`}>
         <div>
-          <span>五小时用量</span>
-          <strong>{formatPercent(globalFiveHourUsage.usedPercent)}</strong>
+          <span>{globalPrimaryUsage.label}</span>
+          <strong>{formatPercent(globalPrimaryUsage.usedPercent)}</strong>
         </div>
         <p>
-          {getUsageToneText(globalFiveHourUsage.usedPercent)}
-          {globalFiveHourUsage.poolLabel ? ` · ${globalFiveHourUsage.poolLabel}` : " · 等待额度数据"}
+          {getUsageToneText(globalPrimaryUsage.usedPercent, globalPrimaryUsage.label)}
+          {globalPrimaryUsage.poolLabel ? ` · ${globalPrimaryUsage.poolLabel}` : " · 等待额度数据"}
           {" · "}
-          {globalFiveHourUsage.resetsAt
-            ? `重置 ${formatResetTime(globalFiveHourUsage.resetsAt)}`
+          {globalPrimaryUsage.resetsAt
+            ? `重置 ${formatResetTime(globalPrimaryUsage.resetsAt)}`
             : "重置时间暂无"}
         </p>
       </aside>
@@ -1881,9 +2084,9 @@ function App() {
                 }
               />
               <span>
-                <strong>切换后自动重启 Codex 客户端</strong>
+                <strong>账号变更后自动重启 Codex 客户端</strong>
                 <small>
-                  会关闭并重新打开官方 Codex 桌面客户端，让它重新读取当前账号。
+                  添加或切换账号成功后关闭并重新打开官方客户端；新版 ChatGPT 客户端的独立登录会话可能仍需手动确认。
                 </small>
               </span>
             </label>
@@ -1945,7 +2148,7 @@ function App() {
           )}
 
           <p className="hint">
-            登录添加账号会调用 Codex app-server 官方登录流程；账号切换由本应用本地完成：备份当前 auth.json，替换为目标账号快照，然后重启 Codex app-server。
+            登录添加账号会调用 Codex app-server 官方登录流程；切换时会先保存当前账号的最新认证，再验证目标账号，失败时自动恢复原账号。
           </p>
         </section>
       ) : null}
@@ -1987,7 +2190,10 @@ function App() {
                     </div>
                     <div className="usage-badge-stack">
                       <span className={`usage-badge usage-badge-${primaryTone}`}>
-                        {getUsageToneText(snapshot.primary?.usedPercent)}
+                        {getUsageToneText(
+                          snapshot.primary?.usedPercent,
+                          formatRateLimitWindowSummaryLabel(snapshot.primary),
+                        )}
                       </span>
                       <span className="usage-badge">
                         {snapshot.rateLimitReachedType ? "受限" : "正常"}

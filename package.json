@@ -13,6 +13,7 @@
     "tauri:build": "tauri build",
     "tauri:build:debug": "tauri build --debug",
     "tauri:dev": "tauri dev",
+    "windows:build": "tauri build --bundles nsis,msi",
     "mac:sign:adhoc": "codesign --force --deep --sign - 'src-tauri/target/release/bundle/macos/Codex Status Floater.app'",
     "mac:dmg:adhoc": "hdiutil create -volname 'Codex Status Floater' -srcfolder 'src-tauri/target/release/bundle/macos/Codex Status Floater.app' -ov -format UDZO 'src-tauri/target/release/bundle/dmg/Codex Status Floater_0.1.0_aarch64_adhoc.dmg'",
     "mac:package:adhoc": "pnpm tauri:build && pnpm mac:sign:adhoc && pnpm mac:dmg:adhoc"

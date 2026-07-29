@@ -130,8 +130,8 @@ export class CodexAppServerClient {
     return this.socket?.readyState === WebSocket.OPEN;
   }
 
-  getAccount() {
-    return this.request<GetAccountResponse>("account/read", { refreshToken: false });
+  getAccount(refreshToken = false) {
+    return this.request<GetAccountResponse>("account/read", { refreshToken });
   }
 
   getRateLimits() {

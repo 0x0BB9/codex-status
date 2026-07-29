@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::BTreeMap,
     fs,
@@ -16,9 +18,14 @@ use tauri::{
 use tauri_plugin_global_shortcut::ShortcutState;
 
 const MAIN_WINDOW_LABEL: &str = "main";
+#[cfg(target_os = "macos")]
 const CODEX_DESKTOP_BUNDLE_ID: &str = "com.openai.codex";
 const TRAY_MENU_TOGGLE: &str = "toggle-window";
 const TRAY_MENU_QUIT: &str = "quit";
+#[cfg(target_os = "windows")]
+const GLOBAL_SHORTCUT: &str = "Ctrl+Alt+Space";
+#[cfg(not(target_os = "windows"))]
+const GLOBAL_SHORTCUT: &str = "Alt+Space";
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct StoredCodexAccount {
@@ -103,6 +110,12 @@ fn codex_home() -> Result<PathBuf, String> {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .map_err(|_| "Unable to resolve Windows user profile directory.".to_string())?;
+
+    #[cfg(not(target_os = "windows"))]
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .map_err(|_| "Unable to resolve home directory.".to_string())?;
@@ -139,17 +152,51 @@ fn read_registry() -> Result<StoredCodexRegistry, String> {
         });
     }
 
-    let content =
-        fs::read_to_string(&path).map_err(|error| format!("Unable to read {}: {error}", path.display()))?;
+    if let Some(parent) = path.parent() {
+        ensure_private_directory(parent)?;
+    }
+    harden_private_file(&path)?;
+    let content = fs::read_to_string(&path)
+        .map_err(|error| format!("Unable to read {}: {error}", path.display()))?;
 
     serde_json::from_str(&content)
         .map_err(|error| format!("Unable to parse {}: {error}", path.display()))
 }
 
+fn ensure_private_directory(path: &Path) -> Result<(), String> {
+    fs::create_dir_all(path)
+        .map_err(|error| format!("Unable to create {}: {error}", path.display()))?;
+
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("Unable to secure {}: {error}", path.display()))?;
+
+    Ok(())
+}
+
+fn harden_private_file(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("Unable to secure {}: {error}", path.display()))?;
+
+    Ok(())
+}
+
+fn replace_json_file(tmp_path: &Path, path: &Path) -> Result<(), String> {
+    // Windows cannot rename over an existing destination with std::fs::rename.
+    #[cfg(target_os = "windows")]
+    if path.exists() {
+        fs::remove_file(path)
+            .map_err(|error| format!("Unable to replace {}: {error}", path.display()))?;
+    }
+
+    fs::rename(tmp_path, path)
+        .map_err(|error| format!("Unable to replace {}: {error}", path.display()))
+}
+
 fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Unable to create {}: {error}", parent.display()))?;
+        ensure_private_directory(parent)?;
     }
 
     let filename = path
@@ -162,13 +209,15 @@ fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
 
     fs::write(&tmp_path, content)
         .map_err(|error| format!("Unable to write {}: {error}", tmp_path.display()))?;
-    fs::rename(&tmp_path, path)
-        .map_err(|error| format!("Unable to replace {}: {error}", path.display()))
+    harden_private_file(&tmp_path)?;
+    replace_json_file(&tmp_path, path)?;
+    harden_private_file(path)
 }
 
 fn read_auth_file(path: &Path) -> Result<Value, String> {
-    let content =
-        fs::read_to_string(path).map_err(|error| format!("Unable to read {}: {error}", path.display()))?;
+    harden_private_file(path)?;
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("Unable to read {}: {error}", path.display()))?;
 
     serde_json::from_str(&content)
         .map_err(|error| format!("Unable to parse {}: {error}", path.display()))
@@ -189,7 +238,9 @@ fn base64url_encode(input: &str) -> String {
         output.push(ALPHABET[(((b0 & 0b0000_0011) << 4) | b1.unwrap_or(0) >> 4) as usize] as char);
 
         if let Some(b1) = b1 {
-            output.push(ALPHABET[(((b1 & 0b0000_1111) << 2) | b2.unwrap_or(0) >> 6) as usize] as char);
+            output.push(
+                ALPHABET[(((b1 & 0b0000_1111) << 2) | b2.unwrap_or(0) >> 6) as usize] as char,
+            );
         }
 
         if let Some(b2) = b2 {
@@ -356,7 +407,10 @@ fn derive_account_from_auth(
     account.auth_mode = Some(auth_mode);
     account.last_used_at = Some(now);
 
-    if let Some(alias) = alias.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+    if let Some(alias) = alias
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
         account.alias = Some(alias);
     }
 
@@ -407,7 +461,7 @@ fn setup_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         TRAY_MENU_TOGGLE,
         "显示/隐藏浮窗",
         true,
-        Some("Alt+Space"),
+        Some(GLOBAL_SHORTCUT),
     )?;
     let quit = MenuItem::with_id(app, TRAY_MENU_QUIT, "退出", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
@@ -481,8 +535,8 @@ fn read_thread_board_state() -> Result<ThreadBoardState, String> {
         });
     }
 
-    let content =
-        fs::read_to_string(&path).map_err(|error| format!("Unable to read {}: {error}", path.display()))?;
+    let content = fs::read_to_string(&path)
+        .map_err(|error| format!("Unable to read {}: {error}", path.display()))?;
 
     serde_json::from_str(&content)
         .map_err(|error| format!("Unable to parse {}: {error}", path.display()))
@@ -498,13 +552,16 @@ fn list_local_codex_accounts() -> Result<StoredCodexRegistry, String> {
 }
 
 #[tauri::command]
-fn save_current_codex_account(params: Option<SaveCurrentAccountParams>) -> Result<StoredCodexRegistry, String> {
+fn save_current_codex_account(
+    params: Option<SaveCurrentAccountParams>,
+) -> Result<StoredCodexRegistry, String> {
     let mut registry = read_registry()?;
     registry.schema_version = registry.schema_version.or(Some(3));
 
     let auth_path = active_auth_path()?;
     let auth = read_auth_file(&auth_path)?;
-    let account = derive_account_from_auth(&auth, &registry, params.and_then(|params| params.alias))?;
+    let account =
+        derive_account_from_auth(&auth, &registry, params.and_then(|params| params.alias))?;
     let account_key = account.account_key.clone();
     let account_path = account_auth_path(&account_key)?;
 
@@ -515,6 +572,34 @@ fn save_current_codex_account(params: Option<SaveCurrentAccountParams>) -> Resul
     write_registry(&registry)?;
 
     Ok(registry)
+}
+
+fn sync_active_account_snapshot(registry: &mut StoredCodexRegistry) -> Result<(), String> {
+    let Some(active_account_key) = registry.active_account_key.clone() else {
+        return Ok(());
+    };
+    let auth_path = active_auth_path()?;
+    if !auth_path.exists() {
+        return Ok(());
+    }
+
+    let auth = read_auth_file(&auth_path)?;
+    let Ok(account) = derive_account_from_auth(&auth, registry, None) else {
+        return Ok(());
+    };
+
+    if account.account_key != active_account_key
+        || !registry
+            .accounts
+            .iter()
+            .any(|saved| saved.account_key == active_account_key)
+    {
+        return Ok(());
+    }
+
+    write_json_file(&account_auth_path(&active_account_key)?, &auth)?;
+    upsert_account(registry, account);
+    Ok(())
 }
 
 #[tauri::command]
@@ -528,9 +613,14 @@ fn switch_local_codex_account(account_key: String) -> Result<AccountSwitchResult
     let account_path = account_auth_path(&account_key)?;
 
     if !account_path.exists() {
-        return Err(format!("Saved auth snapshot is missing: {}", account_path.display()));
+        return Err(format!(
+            "Saved auth snapshot is missing: {}",
+            account_path.display()
+        ));
     }
 
+    // Persist any refresh-token rotation before replacing the active auth file.
+    sync_active_account_snapshot(&mut registry)?;
     let auth = read_auth_file(&account_path)?;
     let backup_path = backup_active_auth()?;
     write_json_file(&active_auth_path()?, &auth)?;
@@ -548,6 +638,11 @@ fn switch_local_codex_account(account_key: String) -> Result<AccountSwitchResult
 
 #[tauri::command]
 fn restart_codex_desktop_client() -> Result<(), String> {
+    restart_codex_desktop_client_for_platform()
+}
+
+#[cfg(target_os = "macos")]
+fn restart_codex_desktop_client_for_platform() -> Result<(), String> {
     let quit_status = Command::new("osascript")
         .arg("-e")
         .arg(format!(
@@ -556,7 +651,9 @@ fn restart_codex_desktop_client() -> Result<(), String> {
         .status();
 
     if !matches!(quit_status, Ok(status) if status.success()) {
-        let _ = Command::new("pkill").args(["-TERM", "-x", "Codex"]).status();
+        let _ = Command::new("pkill")
+            .args(["-TERM", "-x", "Codex"])
+            .status();
     }
 
     thread::sleep(Duration::from_millis(1_500));
@@ -573,6 +670,36 @@ fn restart_codex_desktop_client() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn restart_codex_desktop_client_for_platform() -> Result<(), String> {
+    const RESTART_SCRIPT: &str = r#"$app = Get-StartApps | Where-Object { $_.Name -in @('Codex', 'ChatGPT') } | Sort-Object { if ($_.Name -eq 'Codex') { 0 } else { 1 } } | Select-Object -First 1; if (-not $app) { Write-Error 'Unable to find Codex or ChatGPT in the Windows Start menu.'; exit 1 }; $processName = if ($app.Name -eq 'Codex') { 'Codex' } else { 'ChatGPT' }; Get-Process -Name $processName -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Milliseconds 1500; Start-Process explorer.exe "shell:AppsFolder\$($app.AppID)""#;
+
+    let status = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            RESTART_SCRIPT,
+        ])
+        .status()
+        .map_err(|error| format!("Unable to restart Codex desktop client: {error}"))?;
+
+    if !status.success() {
+        return Err("Unable to restart the Codex desktop client on Windows.".to_string());
+    }
+
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn restart_codex_desktop_client_for_platform() -> Result<(), String> {
+    Err(
+        "Restarting the Codex desktop client is currently supported on macOS and Windows."
+            .to_string(),
+    )
 }
 
 #[tauri::command]
@@ -604,7 +731,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_shortcut("Alt+Space")
+                .with_shortcut(GLOBAL_SHORTCUT)
                 .expect("failed to configure global shortcut")
                 .with_handler(|app, _shortcut, event| {
                     if event.state == ShortcutState::Pressed {

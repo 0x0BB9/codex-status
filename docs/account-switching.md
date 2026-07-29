@@ -4,7 +4,7 @@
 
 ## 文件结构
 
-默认使用 Codex 的本地状态目录：
+默认使用 Codex 的本地状态目录；macOS/Linux 为 `~/.codex`，Windows 为 `%USERPROFILE%\.codex`：
 
 ```text
 ~/.codex/
@@ -16,6 +16,8 @@
 ```
 
 如果设置了 `CODEX_HOME`，并且该目录存在，工具会优先使用 `CODEX_HOME`。
+
+多账号切换依赖文件形式的 `auth.json`。如果 Codex 配置为使用系统钥匙串或 Windows Credential Manager，需要在 `config.toml` 中设置 `cli_auth_credentials_store = "file"` 后重新登录。
 
 ## 各文件用途
 
@@ -29,10 +31,13 @@
 点击“登录添加账号”后：
 
 1. 工具通过 Codex app-server 调用官方登录流程。
-2. 浏览器会打开 Codex 登录页面；如果返回设备码，浮窗会同时显示验证码。
-3. 登录完成后，Codex 会写入当前 `~/.codex/auth.json`。
-4. 浮窗收到 `account/login/completed` 通知后，会读取新的 `auth.json`。
-5. 工具会把完整认证内容保存为 `accounts/<base64url(account_key)>.auth.json`，并更新 `registry.json`。
+2. 如果当前已有登录账号，工具会先把最新认证回写到它的账号快照。
+3. 工具优先打开标准浏览器 OAuth 登录，让用户选择要添加的 ChatGPT 账号。
+4. 只有浏览器登录无法启动时才回退到设备码；设备码登录需要在 ChatGPT 安全设置中启用相关授权。
+5. 登录完成后，Codex 会写入当前 `~/.codex/auth.json`。
+6. 浮窗收到 `account/login/completed` 通知后，会读取新的 `auth.json`。
+7. 工具会把完整认证内容保存为 `accounts/<base64url(account_key)>.auth.json`，并更新 `registry.json`。
+8. 如果打开了“账号变更后自动重启 Codex 客户端”，工具会在账号保存成功后重启官方桌面客户端。
 
 这个流程不依赖 `codex-auth`，也不会在本应用里复刻 OAuth token exchange。
 
@@ -50,17 +55,20 @@
 
 点击账号卡片里的“切换”后：
 
-1. 工具读取目标账号的 `accounts/*.auth.json` 快照。
-2. 工具先把当前 `~/.codex/auth.json` 备份到 `accounts/auth.json.bak.<timestamp>`。
-3. 工具用目标账号快照替换 `~/.codex/auth.json`。
-4. 工具更新 `registry.json` 的 `active_account_key` 和 `last_used_at`。
-5. 浮窗重启自己的 `codex app-server`，让新账号立即生效。
+1. 工具把当前 `~/.codex/auth.json` 回写到当前账号快照，保存 Codex 自动刷新后的最新 token。
+2. 工具把当前认证备份到 `accounts/auth.json.bak.<timestamp>`。
+3. 工具用目标账号快照替换 `~/.codex/auth.json`，并更新 `registry.json`。
+4. 浮窗重启自己的 `codex app-server`，强制刷新并验证目标账号认证。
+5. 验证成功后，再把刷新后的认证回写到目标账号快照。
+6. 如果验证失败，工具会自动切回并验证原账号，避免停留在未登录状态。
 
-如果打开了“切换后自动重启 Codex 客户端”，工具还会在切换成功后重启官方 Codex 桌面客户端。也可以在账号面板里点击“立即重启 Codex 客户端”手动触发。
+如果打开了“账号变更后自动重启 Codex 客户端”，工具会在目标账号验证成功后重启官方 Codex 桌面客户端。也可以在账号面板里点击“立即重启 Codex 客户端”手动触发。
 
-桌面客户端重启只针对 macOS 上 bundle id 为 `com.openai.codex` 的官方 Codex App。实现方式是先请求 Codex 正常退出，如果失败则用 `pkill -TERM -x Codex` 兜底，然后通过 `open -b com.openai.codex` 重新打开。
+macOS 会通过 bundle id `com.openai.codex` 退出并重新打开官方客户端。Windows 会从开始菜单应用注册信息中查找 Codex/ChatGPT，终止对应进程后重新启动注册的桌面应用。
 
 已经运行中的其他 Codex CLI 或 VS Code 扩展不会自动切换账号；它们通常需要重启或重新连接后才会读取新的 `auth.json`。
+
+新版 ChatGPT 桌面客户端可能使用独立于 `~/.codex/auth.json` 的宿主登录会话。工具可以保证自己的 app-server 和之后启动的 CLI 使用已验证账号，但不能修改官方客户端内部的 Cookie、钥匙串或宿主会话；重启后如果账号没有同步，需要在官方客户端内确认登录。
 
 ## 兼容性
 
@@ -78,4 +86,5 @@
 - 工具只管理本机文件，不跨设备同步账号。
 - 认证文件包含敏感 token，不要把 `~/.codex/accounts` 提交到 Git 或发给别人。
 - 重启官方 Codex 桌面客户端会关闭当前 Codex App 窗口；正在进行的客户端会话可能需要重新打开。
+- Windows Store 应用的内部目录可能随官方版本变化；如果无法找到内置 `codex.exe`，可以安装 Codex CLI 作为 PATH 回退。
 - 删除账号、编辑别名、导入外部 auth 文件还没有做成 UI。

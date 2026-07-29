@@ -35,6 +35,22 @@
           ]
         },
         {
+          "name": "codex-app-server-windows-bundled",
+          "cmd": "powershell.exe",
+          "args": [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$paths = @((Join-Path $env:LOCALAPPDATA 'Programs\\Codex\\resources\\codex.exe'), (Join-Path $env:LOCALAPPDATA 'Programs\\ChatGPT\\resources\\codex.exe')) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }; $codex = $paths | Select-Object -First 1; if (-not $codex) { $codex = Get-AppxPackage | Where-Object { $_.Name -match 'OpenAI|ChatGPT|Codex' } | ForEach-Object { Get-ChildItem -LiteralPath $_.InstallLocation -Filter codex.exe -File -Recurse -ErrorAction SilentlyContinue } | Select-Object -First 1 -ExpandProperty FullName }; if (-not $codex) { Write-Error 'Unable to locate codex.exe in the Windows desktop app.'; exit 127 }; & $codex app-server; exit $LASTEXITCODE"
+          ]
+        },
+        {
+          "name": "codex-app-server-windows-path",
+          "cmd": "cmd.exe",
+          "args": ["/D", "/S", "/C", "codex app-server"]
+        },
+        {
           "name": "codex-app-server",
           "cmd": "codex",
           "args": ["app-server"]

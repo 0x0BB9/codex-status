@@ -1,10 +1,10 @@
 # 打包分发说明
 
-这个工具可以打成 macOS App 或 DMG 发给别人使用。应用本身不包含 Codex 账号、token 或任何 `~/.codex` 内容。
+这个工具可以打成 macOS App/DMG 或 Windows NSIS/MSI 安装包发给别人使用。应用本身不包含 Codex 账号、token 或任何用户本机 `.codex` 内容。
 
 ## 使用前提
 
-接收方电脑需要满足其中一种条件：
+macOS 接收方电脑需要满足其中一种条件：
 
 - 已安装官方 Codex 桌面客户端，路径通常是 `/Applications/Codex.app`。
 - 或者已经安装 Codex CLI，并且 `codex app-server` 能在用户 shell 里运行。
@@ -15,6 +15,14 @@
 2. `$HOME/Applications/Codex.app/Contents/Resources/codex`
 3. `/bin/zsh -lc 'source "$HOME/.zshrc"; exec codex app-server'`
 4. 普通 `codex app-server`
+
+Windows 会按以下顺序启动：
+
+1. 查找官方 Codex/ChatGPT 桌面应用常见安装目录中的 `codex.exe`
+2. 查找 Microsoft Store 应用包中的 `codex.exe`
+3. 执行 PATH 中的 `codex app-server`
+
+Windows 使用官方文档约定的 `%USERPROFILE%\.codex` 作为默认状态目录。详细说明见 [windows.md](windows.md)。
 
 ## 本地构建
 
@@ -48,6 +56,24 @@ pnpm mac:package:adhoc
 src-tauri/target/release/bundle/dmg/Codex Status Floater_0.1.0_aarch64_adhoc.dmg
 ```
 
+## Windows 构建
+
+请在 Windows 10/11 或仓库自带的 GitHub Actions Windows Runner 上执行：
+
+```powershell
+pnpm install --frozen-lockfile
+pnpm windows:build
+```
+
+产物通常位于：
+
+```text
+src-tauri\target\release\bundle\nsis\*.exe
+src-tauri\target\release\bundle\msi\*.msi
+```
+
+GitHub 仓库的 `Build Windows` 工作流支持手动触发，也会在推送 `v*` 标签时构建并上传安装包 artifact。
+
 ## 分发前检查
 
 发布前至少确认：
@@ -77,9 +103,11 @@ thread-board.json
 
 如果要公开分发，建议使用 Apple Developer ID 对 release 产物签名并 notarize。签名只影响 macOS 信任链，不会改变应用读取用户本机 Codex 状态的逻辑。
 
+Windows 未签名安装包可能触发 Microsoft Defender SmartScreen。公开分发时应配置可信代码签名证书；GitHub Actions 默认只生成未签名测试包。
+
 ## 隐私边界
 
-- 应用只在用户本机读取 Codex app-server、本机 `~/.codex/auth.json` 和本机任务元数据。
-- 账号快照保存在用户自己的 `~/.codex/accounts/`。
+- 应用只在用户本机读取 Codex app-server、本机 `.codex/auth.json` 和本机任务元数据。
+- 账号快照保存在用户自己的 `.codex/accounts/`。
 - 本项目不内置任何服务端，也不会上传 token。
 - 打包产物不应包含开发者自己的 `~/.codex` 目录。
