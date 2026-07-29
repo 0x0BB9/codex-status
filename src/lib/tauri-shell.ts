@@ -30,11 +30,24 @@ type CodexAppServerShellClientOptions = {
 };
 
 const RPC_TIMEOUT_MS = 8_000;
+const SIDECAR_APP_SERVER_ARGS = [
+  "-c",
+  'cli_auth_credentials_store="file"',
+  "app-server",
+] as const;
 const ZSH_CODEX_APP_SERVER_SCRIPT =
   'source "$HOME/.zshrc" >/dev/null 2>&1; exec codex app-server';
 const POWERSHELL_CODEX_APP_SERVER_SCRIPT =
   "$paths = @((Join-Path $env:LOCALAPPDATA 'Programs\\Codex\\resources\\codex.exe'), (Join-Path $env:LOCALAPPDATA 'Programs\\ChatGPT\\resources\\codex.exe')) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }; $codex = $paths | Select-Object -First 1; if (-not $codex) { $codex = Get-AppxPackage | Where-Object { $_.Name -match 'OpenAI|ChatGPT|Codex' } | ForEach-Object { Get-ChildItem -LiteralPath $_.InstallLocation -Filter codex.exe -File -Recurse -ErrorAction SilentlyContinue } | Select-Object -First 1 -ExpandProperty FullName }; if (-not $codex) { Write-Error 'Unable to locate codex.exe in the Windows desktop app.'; exit 127 }; & $codex app-server; exit $LASTEXITCODE";
 const MACOS_COMMANDS = [
+  {
+    args: ["app-server"],
+    name: "codex-app-server-chatgpt-bundled",
+  },
+  {
+    args: ["app-server"],
+    name: "codex-app-server-user-chatgpt-bundled",
+  },
   {
     args: ["app-server"],
     name: "codex-app-server-bundled",
@@ -64,17 +77,22 @@ const PATH_COMMAND = [
     name: "codex-app-server",
   },
 ] as const;
+const SIDECAR_COMMAND = {
+  args: SIDECAR_APP_SERVER_ARGS,
+  name: "binaries/codex-app-server",
+  sidecar: true,
+} as const;
 
 function getAppServerCommands() {
   if (navigator.userAgent.includes("Windows")) {
-    return [...WINDOWS_COMMANDS, ...PATH_COMMAND];
+    return [SIDECAR_COMMAND, ...WINDOWS_COMMANDS, ...PATH_COMMAND];
   }
 
   if (navigator.userAgent.includes("Macintosh")) {
-    return [...MACOS_COMMANDS, ...PATH_COMMAND];
+    return [SIDECAR_COMMAND, ...MACOS_COMMANDS, ...PATH_COMMAND];
   }
 
-  return [...PATH_COMMAND];
+  return [SIDECAR_COMMAND, ...PATH_COMMAND];
 }
 
 export function isTauriRuntime() {
@@ -126,7 +144,10 @@ export class CodexAppServerShellClient {
 
     for (const commandConfig of getAppServerCommands()) {
       try {
-        const command = Command.create(commandConfig.name, [...commandConfig.args]);
+        const command =
+          "sidecar" in commandConfig && commandConfig.sidecar
+            ? Command.sidecar(commandConfig.name, [...commandConfig.args])
+            : Command.create(commandConfig.name, [...commandConfig.args]);
 
         command.stdout.on("data", (chunk) => this.handleStdout(chunk));
         command.stderr.on("data", (line) => this.options.onServerLog?.(line));

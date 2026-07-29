@@ -19,6 +19,7 @@ thread-board.json
 node_modules
 dist
 dist-ssr
+src-tauri/binaries/
 *.local
 
 # Editor directories and files

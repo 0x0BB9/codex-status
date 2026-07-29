@@ -4,23 +4,21 @@
 
 ## 使用前提
 
-macOS 接收方电脑需要满足其中一种条件：
+发布安装包内置官方 Codex 原生二进制，并以 Tauri sidecar 方式在本机启动 `codex app-server`。macOS 和 Windows 接收方都不需要额外安装 Node.js、npm、pnpm 或 Codex CLI。
 
-- 已安装官方 Codex 桌面客户端，路径通常是 `/Applications/Codex.app`。
-- 或者已经安装 Codex CLI，并且 `codex app-server` 能在用户 shell 里运行。
+macOS 启动顺序是：
 
-应用启动 `codex app-server` 的顺序是：
+1. 安装包内置的 Codex sidecar
+2. `/Applications/ChatGPT.app` 或 `/Applications/Codex.app` 内的 Codex 二进制
+3. 用户 Applications 目录中的官方客户端
+4. 用户 shell 或 PATH 中的 Codex CLI
 
-1. `/Applications/Codex.app/Contents/Resources/codex`
-2. `$HOME/Applications/Codex.app/Contents/Resources/codex`
-3. `/bin/zsh -lc 'source "$HOME/.zshrc"; exec codex app-server'`
-4. 普通 `codex app-server`
+Windows 启动顺序是：
 
-Windows 会按以下顺序启动：
-
-1. 查找官方 Codex/ChatGPT 桌面应用常见安装目录中的 `codex.exe`
-2. 查找 Microsoft Store 应用包中的 `codex.exe`
-3. 执行 PATH 中的 `codex app-server`
+1. 安装包内置的 Codex sidecar
+2. 官方 Codex/ChatGPT 桌面应用常见安装目录中的 `codex.exe`
+3. Microsoft Store 应用包中的 `codex.exe`
+4. PATH 中的 `codex app-server`
 
 Windows 使用官方文档约定的 `%USERPROFILE%\.codex` 作为默认状态目录。详细说明见 [windows.md](windows.md)。
 
@@ -110,4 +108,5 @@ Windows 未签名安装包可能触发 Microsoft Defender SmartScreen。公开�
 - 应用只在用户本机读取 Codex app-server、本机 `.codex/auth.json` 和本机任务元数据。
 - 账号快照保存在用户自己的 `.codex/accounts/`。
 - 本项目不内置任何服务端，也不会上传 token。
+- 安装包会包含 Apache-2.0 许可的官方 Codex 原生二进制和第三方声明，不包含开发者账号数据。
 - 打包产物不应包含开发者自己的 `~/.codex` 目录。

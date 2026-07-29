@@ -1,5 +1,16 @@
 # Windows 支持说明
 
+## 给运营同事的使用步骤
+
+安装包已经内置官方 Codex 登录服务。接收方不需要安装 Node.js、npm、pnpm 或 Codex CLI。
+
+1. 安装并打开 Codex Status Floater。
+2. 点击“登录添加账号”，在浏览器中登录第一个 ChatGPT/Codex 账号。
+3. 再次点击“登录添加账号”，在浏览器中选择第二个账号。
+4. 以后在账号卡片上点击“切换”即可。建议保持“账号变更后自动重启 Codex 客户端”开启。
+
+账号、Token 和账号快照只保存在当前 Windows 用户目录，不会打进安装包，也不会上传到本项目的服务端。
+
 ## 支持范围
 
 Windows 10/11 x64 版本支持以下功能：
@@ -14,14 +25,15 @@ Windows 10/11 x64 版本支持以下功能：
 
 ## Codex app-server 探测
 
-浮窗需要启动官方 `codex app-server`。Windows 会依次尝试：
+浮窗需要启动官方 `codex app-server`。发布安装包会内置与应用一起分发的官方 Codex 原生二进制，Windows 会依次尝试：
 
-1. `%LOCALAPPDATA%\Programs\Codex\resources\codex.exe`
-2. `%LOCALAPPDATA%\Programs\ChatGPT\resources\codex.exe`
-3. Microsoft Store 中名称匹配 OpenAI、ChatGPT 或 Codex 的应用包
-4. PATH 中的 `codex app-server`
+1. 安装包内置的 Codex sidecar
+2. `%LOCALAPPDATA%\Programs\Codex\resources\codex.exe`
+3. `%LOCALAPPDATA%\Programs\ChatGPT\resources\codex.exe`
+4. Microsoft Store 中名称匹配 OpenAI、ChatGPT 或 Codex 的应用包
+5. PATH 中的 `codex app-server`
 
-官方桌面应用内部结构不是稳定的公共接口。如果桌面应用升级后无法找到内置 `codex.exe`，PATH 中安装的 Codex CLI 会作为兼容回退。
+因此接收方不需要额外安装 CLI。桌面应用路径和 PATH 只作为兼容回退，不是正常运行的前提。
 
 ## 本地数据
 
@@ -39,13 +51,19 @@ Windows 官方 Codex App 和本工具默认共用：
 
 如果存在有效的 `CODEX_HOME`，应用会优先使用该目录。认证文件依赖当前 Windows 用户目录的 ACL，不会包含在安装包中。
 
-多账号快照依赖文件形式的 `auth.json`。如果 Windows Codex 把凭据存入 Credential Manager，请在 `%USERPROFILE%\.codex\config.toml` 中设置：
+多账号快照依赖文件形式的 `auth.json`。用户第一次执行“登录添加账号”“保存当前账号”或“切换”时，应用会自动在 `%USERPROFILE%\.codex\config.toml` 中设置：
 
 ```toml
 cli_auth_credentials_store = "file"
 ```
 
-设置后重新登录一次，再使用“保存当前账号”或“登录添加账号”。这只改变 Codex 的本机凭据存储方式，不会把 Token 上传到本工具。
+如果原配置需要修改，应用会先生成：
+
+```text
+%USERPROFILE%\.codex\config.toml.bak.status-floater
+```
+
+用户不需要手动编辑配置。这个设置只改变 Codex 的本机凭据存储方式，不会上传 Token。
 
 ## 本地构建
 
@@ -68,6 +86,6 @@ src-tauri\target\release\bundle\msi
 ## 已知限制
 
 - Windows 安装包目前没有代码签名，首次安装可能出现 SmartScreen 提示。
-- Windows Store 应用内部路径可能发生变化，需要在真实 Windows 环境持续验证。
 - 切换账号后重启客户端会关闭现有 Codex 窗口。
+- 新版 ChatGPT/Codex 桌面客户端可能维护独立于 `.codex/auth.json` 的宿主登录会话。本工具能保证自己的 app-server 和之后启动的 CLI 使用目标账号，但实际官方客户端仍需在 Windows 真机确认；如果没有同步，需要在官方客户端内确认登录。
 - WSL 有独立的 Linux home；除非设置 `CODEX_HOME`，否则 WSL CLI 不会自动共享 `%USERPROFILE%\.codex`。

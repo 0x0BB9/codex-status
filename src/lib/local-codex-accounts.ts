@@ -27,8 +27,18 @@ export type AccountSwitchResult = {
   registry: StoredCodexRegistry;
 };
 
+export type AuthStorageConfigResult = {
+  backup_path?: string | null;
+  changed: boolean;
+  config_path: string;
+};
+
 export async function listLocalCodexAccounts() {
   return invoke<StoredCodexRegistry>("list_local_codex_accounts");
+}
+
+export async function ensureFileAuthCredentialsStore() {
+  return invoke<AuthStorageConfigResult>("ensure_file_auth_credentials_store");
 }
 
 export async function saveCurrentCodexAccount(alias?: string) {

@@ -25,6 +25,7 @@ import type {
 } from "./generated/v2";
 import { CodexAppServerClient, DEFAULT_CODEX_WS_URL } from "./lib/codex-app-server";
 import {
+  ensureFileAuthCredentialsStore,
   listLocalCodexAccounts,
   restartCodexDesktopClient,
   saveCurrentCodexAccount,
@@ -647,7 +648,7 @@ function formatConnectionError(message: string | null) {
   }
 
   if (message.startsWith("Unable to start codex app-server.")) {
-    return "无法启动 codex app-server。请确认 Codex CLI 可用，详情见下方日志。";
+    return "无法启动内置 Codex 服务。请重新安装应用或查看下方日志。";
   }
 
   switch (message) {
@@ -1461,7 +1462,16 @@ function App() {
     setCodexClientRestartMessage(null);
 
     try {
-      if (!clientRef.current || !clientRef.current.isConnected()) {
+      const authStorage = await ensureFileAuthCredentialsStore();
+      if (authStorage.changed) {
+        setAccountLoginMessage("已启用本机多账号存储，正在启动登录...");
+      }
+
+      if (
+        authStorage.changed ||
+        !clientRef.current ||
+        !clientRef.current.isConnected()
+      ) {
         await connectToServer({ launchIfNeeded: true });
       }
 
@@ -1573,6 +1583,7 @@ function App() {
     setRateLimitError(null);
 
     try {
+      await ensureFileAuthCredentialsStore();
       await disconnectClient("Reconnecting");
       const result = await switchLocalCodexAccount(accountKey);
       accountWasReplaced = true;
@@ -1605,12 +1616,12 @@ function App() {
         const restarted = await handleRestartCodexClient();
         if (restarted) {
           setCodexClientRestartMessage(
-            "已重启官方客户端。浮窗和 CLI 已切换；新版 ChatGPT 客户端如使用独立会话，可能仍需在客户端内确认账号。",
+            "已重启官方客户端。浮窗账号已切换；新版 ChatGPT 客户端如使用独立会话，可能仍需在客户端内确认账号。",
           );
         }
       } else {
         setCodexClientRestartMessage(
-          "浮窗和 CLI 已完成账号切换；官方桌面客户端尚未重启。",
+          "浮窗账号已完成切换；官方桌面客户端尚未重启。",
         );
       }
     } catch (error) {
@@ -1687,6 +1698,7 @@ function App() {
     setAccountLoginMessage(null);
 
     try {
+      await ensureFileAuthCredentialsStore();
       const registry = await saveCurrentCodexAccount();
       setAuthRegistry(registry);
       setLastEvent("account/saved");
@@ -2148,7 +2160,7 @@ function App() {
           )}
 
           <p className="hint">
-            登录添加账号会调用 Codex app-server 官方登录流程；切换时会先保存当前账号的最新认证，再验证目标账号，失败时自动恢复原账号。
+            安装包已内置官方 Codex 登录服务，无需安装 CLI。新增和切换只读写本机账号快照；切换失败时会自动恢复原账号。
           </p>
         </section>
       ) : null}

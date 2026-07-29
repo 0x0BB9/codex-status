@@ -6,6 +6,7 @@ A small Tauri utility window that keeps two Codex pain points visible:
 - live thread status changes across recent projects
 
 It reads data from the official `codex app-server` surface and is designed to stay pinned beside your main workspace.
+Packaged builds include the official Codex native binary as a local sidecar, so recipients do not need to install Node.js, npm, pnpm, or the Codex CLI.
 
 ## What It Shows
 
@@ -25,6 +26,7 @@ The app implements local account switching itself. It does not require `codex-au
 
 - Saved accounts live under `~/.codex/accounts/`.
 - The active account is still the standard `~/.codex/auth.json` used by Codex.
+- The app automatically enables file-backed Codex credentials before adding, saving, or switching an account and backs up an existing config before changing it.
 - Clicking "登录添加账号" starts the official Codex app-server login flow, then saves the completed auth as a local snapshot.
 - Clicking "保存当前账号" stores the currently logged-in Codex auth as a local snapshot.
 - Clicking "切换" first saves the active account's latest tokens, replaces `auth.json`, then forces Codex to refresh and verify the target account.
@@ -75,7 +77,7 @@ The Tauri shell is configured to:
 - snap to screen edges after dragging near a boundary
 - dim after idle and collapse into a right-edge capsule when docked to the screen edge
 - appear as a narrow side utility window
-- launch `codex app-server` over stdio from the official desktop app or the user's PATH
+- launch the bundled official `codex app-server` sidecar over stdio, with installed desktop apps and PATH as compatibility fallbacks
 - manage local Codex account snapshots through Tauri commands
 
 ## Build Notes

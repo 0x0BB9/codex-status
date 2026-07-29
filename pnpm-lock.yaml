@@ -24,6 +24,9 @@ importers:
         specifier: ^19.1.0
         version: 19.2.7(react@19.2.7)
     devDependencies:
+      '@openai/codex':
+        specifier: 0.146.0
+        version: 0.146.0
       '@tauri-apps/cli':
         specifier: ^2
         version: 2.11.2
@@ -299,6 +302,47 @@ packages:
 
   '@jridgewell/trace-mapping@0.3.31':
     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
+
+  '@openai/codex@0.146.0':
+    resolution: {integrity: sha512-yG3sPWNda/2YAIQIDq9MrrjoCTIQ7rxYM5IasrG3VBcuhCLTkgeg/JzqmJq1V98RE4MJ5jCxDXXQlOjrditFRw==}
+    engines: {node: '>=16'}
+    hasBin: true
+
+  '@openai/codex@0.146.0-darwin-arm64':
+    resolution: {integrity: sha512-nb61yX4r5L6Z0dlC4o3u0GAK1YCd4TUvjaB382bajDoh84V+uv2hTBIVZ++fgXWV9yoeuNrNnNcn7GoTGOe2Tg==}
+    engines: {node: '>=16'}
+    cpu: [arm64]
+    os: [darwin]
+
+  '@openai/codex@0.146.0-darwin-x64':
+    resolution: {integrity: sha512-hTQR5jy/ObfTf1MDnuJCZJAe+SljKE8DDwQWN6lDFgjsPhMQz852U2tILt8Ei+G5GkQSzemHYKl2AYPwW0Y5xw==}
+    engines: {node: '>=16'}
+    cpu: [x64]
+    os: [darwin]
+
+  '@openai/codex@0.146.0-linux-arm64':
+    resolution: {integrity: sha512-qiYDxkkEFnXG7joadJW6Q+XcgyDXCpGdpa9nk/c+i0gEomur1j7bHvx12NfWWCF/y8Tqri6ay+FLuC2MjdehtA==}
+    engines: {node: '>=16'}
+    cpu: [arm64]
+    os: [linux]
+
+  '@openai/codex@0.146.0-linux-x64':
+    resolution: {integrity: sha512-fswvyGprAPCMiOEue/7MKMk7pCjh9kZIJfJX5i9atmfnmGYbYCcUhZsEH9LEP0+0t5xyPqDbfNXY7NSxIVuXxA==}
+    engines: {node: '>=16'}
+    cpu: [x64]
+    os: [linux]
+
+  '@openai/codex@0.146.0-win32-arm64':
+    resolution: {integrity: sha512-EW6zdjDe+SLX2Iw+xymJ5+Pz2+DGexdstfFHXh4Ub+TfJsQPiMjGfZfNaoWgdJ2FsqSIzVKu2+G0KCMGYz2W8g==}
+    engines: {node: '>=16'}
+    cpu: [arm64]
+    os: [win32]
+
+  '@openai/codex@0.146.0-win32-x64':
+    resolution: {integrity: sha512-b3lxMYeR0+IhstNo4JjX1P9cPc1xwVcCVkPd1lD1wpWPJ0SBhpIkPczwbu3ZRkJcdyl342+rgyf4DUrbZLdrGA==}
+    engines: {node: '>=16'}
+    cpu: [x64]
+    os: [win32]
 
   '@rolldown/pluginutils@1.0.0-beta.27':
     resolution: {integrity: sha512-+d0F4MKMCbeVUJwG96uQ4SgAznZNSq93I3V+9NHA4OpvqG8mRCpGdKmK8l/dl02h2CCDHwW2FqilnTyDcAnqjA==}
@@ -949,6 +993,33 @@ snapshots:
     dependencies:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.5.5
+
+  '@openai/codex@0.146.0':
+    optionalDependencies:
+      '@openai/codex-darwin-arm64': '@openai/codex@0.146.0-darwin-arm64'
+      '@openai/codex-darwin-x64': '@openai/codex@0.146.0-darwin-x64'
+      '@openai/codex-linux-arm64': '@openai/codex@0.146.0-linux-arm64'
+      '@openai/codex-linux-x64': '@openai/codex@0.146.0-linux-x64'
+      '@openai/codex-win32-arm64': '@openai/codex@0.146.0-win32-arm64'
+      '@openai/codex-win32-x64': '@openai/codex@0.146.0-win32-x64'
+
+  '@openai/codex@0.146.0-darwin-arm64':
+    optional: true
+
+  '@openai/codex@0.146.0-darwin-x64':
+    optional: true
+
+  '@openai/codex@0.146.0-linux-arm64':
+    optional: true
+
+  '@openai/codex@0.146.0-linux-x64':
+    optional: true
+
+  '@openai/codex@0.146.0-win32-arm64':
+    optional: true
+
+  '@openai/codex@0.146.0-win32-x64':
+    optional: true
 
   '@rolldown/pluginutils@1.0.0-beta.27': {}
 

@@ -17,7 +17,7 @@
 
 如果设置了 `CODEX_HOME`，并且该目录存在，工具会优先使用 `CODEX_HOME`。
 
-多账号切换依赖文件形式的 `auth.json`。如果 Codex 配置为使用系统钥匙串或 Windows Credential Manager，需要在 `config.toml` 中设置 `cli_auth_credentials_store = "file"` 后重新登录。
+多账号切换依赖文件形式的 `auth.json`。执行添加、保存或切换账号时，工具会自动在 `config.toml` 中设置 `cli_auth_credentials_store = "file"`；如果需要修改已有配置，会先备份为 `config.toml.bak.status-floater`。用户不需要手动编辑配置。
 
 ## 各文件用途
 
@@ -30,14 +30,15 @@
 
 点击“登录添加账号”后：
 
-1. 工具通过 Codex app-server 调用官方登录流程。
-2. 如果当前已有登录账号，工具会先把最新认证回写到它的账号快照。
-3. 工具优先打开标准浏览器 OAuth 登录，让用户选择要添加的 ChatGPT 账号。
-4. 只有浏览器登录无法启动时才回退到设备码；设备码登录需要在 ChatGPT 安全设置中启用相关授权。
-5. 登录完成后，Codex 会写入当前 `~/.codex/auth.json`。
-6. 浮窗收到 `account/login/completed` 通知后，会读取新的 `auth.json`。
-7. 工具会把完整认证内容保存为 `accounts/<base64url(account_key)>.auth.json`，并更新 `registry.json`。
-8. 如果打开了“账号变更后自动重启 Codex 客户端”，工具会在账号保存成功后重启官方桌面客户端。
+1. 工具自动启用文件形式的本机 Codex 凭据存储。
+2. 工具通过安装包内置的官方 Codex app-server 调用官方登录流程。
+3. 如果当前已有登录账号，工具会先把最新认证回写到它的账号快照。
+4. 工具优先打开标准浏览器 OAuth 登录，让用户选择要添加的 ChatGPT 账号。
+5. 只有浏览器登录无法启动时才回退到设备码；设备码登录需要在 ChatGPT 安全设置中启用相关授权。
+6. 登录完成后，Codex 会写入当前 `~/.codex/auth.json`。
+7. 浮窗收到 `account/login/completed` 通知后，会读取新的 `auth.json`。
+8. 工具会把完整认证内容保存为 `accounts/<base64url(account_key)>.auth.json`，并更新 `registry.json`。
+9. 如果打开了“账号变更后自动重启 Codex 客户端”，工具会在账号保存成功后重启官方桌面客户端。
 
 这个流程不依赖 `codex-auth`，也不会在本应用里复刻 OAuth token exchange。
 
@@ -83,8 +84,8 @@ macOS 会通过 bundle id `com.openai.codex` 退出并重新打开官方客户�
 ## 限制
 
 - 这个工具调用 Codex app-server 的官方登录流程，不直接实现 OAuth token exchange。
+- 发布安装包内置官方 Codex app-server，因此接收方不需要安装 Codex CLI。
 - 工具只管理本机文件，不跨设备同步账号。
 - 认证文件包含敏感 token，不要把 `~/.codex/accounts` 提交到 Git 或发给别人。
 - 重启官方 Codex 桌面客户端会关闭当前 Codex App 窗口；正在进行的客户端会话可能需要重新打开。
-- Windows Store 应用的内部目录可能随官方版本变化；如果无法找到内置 `codex.exe`，可以安装 Codex CLI 作为 PATH 回退。
 - 删除账号、编辑别名、导入外部 auth 文件还没有做成 UI。

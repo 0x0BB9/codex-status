@@ -1,11 +1,12 @@
 {
   "name": "codex-status-floater",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "prepare:codex-sidecar": "node scripts/prepare-codex-sidecar.mjs",
     "preview": "vite preview",
     "protocol:generate": "codex app-server generate-ts --out src/generated",
     "server:listen": "codex app-server --listen ws://127.0.0.1:48123",
@@ -26,6 +27,7 @@
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
+    "@openai/codex": "0.146.0",
     "@tauri-apps/cli": "^2",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",

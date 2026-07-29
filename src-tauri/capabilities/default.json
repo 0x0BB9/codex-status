@@ -17,6 +17,25 @@
       "identifier": "shell:allow-spawn",
       "allow": [
         {
+          "name": "binaries/codex-app-server",
+          "sidecar": true,
+          "args": [
+            "-c",
+            "cli_auth_credentials_store=\"file\"",
+            "app-server"
+          ]
+        },
+        {
+          "name": "codex-app-server-chatgpt-bundled",
+          "cmd": "/Applications/ChatGPT.app/Contents/Resources/codex",
+          "args": ["app-server"]
+        },
+        {
+          "name": "codex-app-server-user-chatgpt-bundled",
+          "cmd": "$HOME/Applications/ChatGPT.app/Contents/Resources/codex",
+          "args": ["app-server"]
+        },
+        {
           "name": "codex-app-server-bundled",
           "cmd": "/Applications/Codex.app/Contents/Resources/codex",
           "args": ["app-server"]

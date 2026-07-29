@@ -16,6 +16,7 @@ use tauri::{
     AppHandle, Manager, Runtime, WindowEvent,
 };
 use tauri_plugin_global_shortcut::ShortcutState;
+use toml_edit::{value, DocumentMut};
 
 const MAIN_WINDOW_LABEL: &str = "main";
 #[cfg(target_os = "macos")]
@@ -65,6 +66,13 @@ struct SaveCurrentAccountParams {
 struct AccountSwitchResult {
     backup_path: Option<String>,
     registry: StoredCodexRegistry,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthStorageConfigResult {
+    backup_path: Option<String>,
+    changed: bool,
+    config_path: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -135,6 +143,10 @@ fn active_auth_path() -> Result<PathBuf, String> {
     Ok(codex_home()?.join("auth.json"))
 }
 
+fn codex_config_path() -> Result<PathBuf, String> {
+    Ok(codex_home()?.join("config.toml"))
+}
+
 fn floater_state_dir() -> Result<PathBuf, String> {
     Ok(codex_home()?.join("status-floater"))
 }
@@ -194,7 +206,7 @@ fn replace_json_file(tmp_path: &Path, path: &Path) -> Result<(), String> {
         .map_err(|error| format!("Unable to replace {}: {error}", path.display()))
 }
 
-fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+fn write_private_file(path: &Path, content: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         ensure_private_directory(parent)?;
     }
@@ -204,14 +216,18 @@ fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("Invalid file path: {}", path.display()))?;
     let tmp_path = path.with_file_name(format!(".{filename}.{}.tmp", now_unix_millis()));
-    let content = serde_json::to_vec_pretty(value)
-        .map_err(|error| format!("Unable to serialize {}: {error}", path.display()))?;
 
     fs::write(&tmp_path, content)
         .map_err(|error| format!("Unable to write {}: {error}", tmp_path.display()))?;
     harden_private_file(&tmp_path)?;
     replace_json_file(&tmp_path, path)?;
     harden_private_file(path)
+}
+
+fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    let content = serde_json::to_vec_pretty(value)
+        .map_err(|error| format!("Unable to serialize {}: {error}", path.display()))?;
+    write_private_file(path, &content)
 }
 
 fn read_auth_file(path: &Path) -> Result<Value, String> {
@@ -551,6 +567,66 @@ fn list_local_codex_accounts() -> Result<StoredCodexRegistry, String> {
     read_registry()
 }
 
+fn configure_file_auth_credentials_store(existing_content: &str) -> Result<(String, bool), String> {
+    let mut document = if existing_content.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        existing_content
+            .parse::<DocumentMut>()
+            .map_err(|error| format!("Invalid Codex config TOML: {error}"))?
+    };
+
+    if document
+        .get("cli_auth_credentials_store")
+        .and_then(|item| item.as_str())
+        == Some("file")
+    {
+        return Ok((existing_content.to_string(), false));
+    }
+
+    document["cli_auth_credentials_store"] = value("file");
+    Ok((document.to_string(), true))
+}
+
+#[tauri::command]
+fn ensure_file_auth_credentials_store() -> Result<AuthStorageConfigResult, String> {
+    let config_path = codex_config_path()?;
+    let existing_content = if config_path.exists() {
+        fs::read_to_string(&config_path)
+            .map_err(|error| format!("Unable to read {}: {error}", config_path.display()))?
+    } else {
+        String::new()
+    };
+    let (updated_content, changed) = configure_file_auth_credentials_store(&existing_content)
+        .map_err(|error| format!("Unable to update {}: {error}", config_path.display()))?;
+
+    if !changed {
+        return Ok(AuthStorageConfigResult {
+            backup_path: None,
+            changed: false,
+            config_path: config_path.display().to_string(),
+        });
+    }
+
+    let backup_path = if config_path.exists() && !existing_content.is_empty() {
+        let backup_path = config_path.with_file_name("config.toml.bak.status-floater");
+        if !backup_path.exists() {
+            write_private_file(&backup_path, existing_content.as_bytes())?;
+        }
+        Some(backup_path)
+    } else {
+        None
+    };
+
+    write_private_file(&config_path, updated_content.as_bytes())?;
+
+    Ok(AuthStorageConfigResult {
+        backup_path: backup_path.map(|path| path.display().to_string()),
+        changed: true,
+        config_path: config_path.display().to_string(),
+    })
+}
+
 #[tauri::command]
 fn save_current_codex_account(
     params: Option<SaveCurrentAccountParams>,
@@ -756,6 +832,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_local_codex_accounts,
+            ensure_file_auth_credentials_store,
             save_current_codex_account,
             switch_local_codex_account,
             restart_codex_desktop_client,
@@ -764,4 +841,41 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::configure_file_auth_credentials_store;
+
+    #[test]
+    fn adds_file_auth_store_without_removing_existing_config() {
+        let existing = "# keep this comment\nmodel = \"gpt-5\"\n";
+        let (updated, changed) =
+            configure_file_auth_credentials_store(existing).expect("config should update");
+
+        assert!(changed);
+        assert!(updated.contains("# keep this comment"));
+        assert!(updated.contains("model = \"gpt-5\""));
+        assert!(updated.contains("cli_auth_credentials_store = \"file\""));
+    }
+
+    #[test]
+    fn leaves_file_auth_store_unchanged() {
+        let existing = "cli_auth_credentials_store = \"file\"\nmodel = \"gpt-5\"\n";
+        let (updated, changed) =
+            configure_file_auth_credentials_store(existing).expect("config should parse");
+
+        assert!(!changed);
+        assert_eq!(updated, existing);
+    }
+
+    #[test]
+    fn replaces_non_file_auth_store() {
+        let existing = "cli_auth_credentials_store = \"keyring\"\n";
+        let (updated, changed) =
+            configure_file_auth_credentials_store(existing).expect("config should update");
+
+        assert!(changed);
+        assert_eq!(updated, "cli_auth_credentials_store = \"file\"\n");
+    }
 }
