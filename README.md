@@ -49,6 +49,8 @@ See [docs/thread-board.md](docs/thread-board.md) for the storage location and fi
 
 For packaging and sharing the app with other users, see [docs/distribution.md](docs/distribution.md). Windows-specific behavior and build instructions are in [docs/windows.md](docs/windows.md).
 
+Release notes and version history are available in [CHANGELOG.md](CHANGELOG.md).
+
 ## Local Web Preview
 
 Run:
