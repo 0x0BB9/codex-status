@@ -1,5 +1,7 @@
 # Codex Status Floater
 
+English | [简体中文](README.zh-CN.md)
+
 A small Tauri utility window that keeps two Codex pain points visible:
 
 - current ChatGPT / Codex rate-limit buckets
