@@ -82,6 +82,12 @@ pnpm tauri:build
 git diff --check
 ```
 
+## 本地安装包归档
+
+构建完成后，将同一版本的 macOS 和 Windows 安装包统一放入项目根目录的 `release-assets/v版本号/`。该版本目录已被 Git 忽略，只作为本机工作区内的发布归档；目录约定见 [`release-assets/README.md`](../release-assets/README.md)。
+
+安装包还应上传到对应的 GitHub Release，供其他用户长期下载。Actions Artifact 只用于构建过程中的临时交付，不能代替正式 Release。
+
 不要把这些本地文件或目录放进发行包或 Git 仓库：
 
 ```text
