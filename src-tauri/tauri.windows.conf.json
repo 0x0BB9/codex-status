@@ -1,0 +1,23 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Codex Status Floater",
+        "width": 430,
+        "height": 860,
+        "minWidth": 360,
+        "minHeight": 620,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": true,
+        "maximizable": false,
+        "minimizable": false,
+        "transparent": true,
+        "decorations": false,
+        "shadow": true
+      }
+    ]
+  }
+}

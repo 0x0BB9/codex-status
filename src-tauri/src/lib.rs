@@ -13,8 +13,10 @@ use std::{
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, Runtime, WindowEvent,
+    AppHandle, Manager, Runtime, WebviewWindow, WindowEvent,
 };
+#[cfg(target_os = "windows")]
+use tauri::PhysicalPosition;
 use tauri_plugin_global_shortcut::ShortcutState;
 use toml_edit::{value, DocumentMut};
 
@@ -453,8 +455,48 @@ fn write_registry(registry: &StoredCodexRegistry) -> Result<(), String> {
     write_json_file(&registry_path()?, registry)
 }
 
+#[cfg(target_os = "windows")]
+fn position_windows_floating_window<R: Runtime>(window: &WebviewWindow<R>) {
+    let monitor = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| window.primary_monitor().ok().flatten());
+    let (Some(monitor), Ok(size)) = (monitor, window.outer_size()) else {
+        return;
+    };
+    let work_area = monitor.work_area();
+    let margin = (12.0 * monitor.scale_factor()).round().max(12.0) as i32;
+    let available_x = work_area.size.width.saturating_sub(size.width) as i32;
+    let position = PhysicalPosition::new(
+        work_area
+            .position
+            .x
+            .saturating_add((available_x - margin).max(0)),
+        work_area.position.y.saturating_add(margin),
+    );
+
+    let _ = window.set_position(position);
+}
+
+fn configure_main_window<R: Runtime>(window: &WebviewWindow<R>, position_window: bool) {
+    let _ = window.set_always_on_top(true);
+
+    #[cfg(not(target_os = "windows"))]
+    let _ = position_window;
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = window.set_skip_taskbar(true);
+        if position_window {
+            position_windows_floating_window(window);
+        }
+    }
+}
+
 fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        configure_main_window(&window, false);
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
@@ -820,6 +862,9 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             setup_tray(app.handle())?;
+            if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+                configure_main_window(&window, true);
+            }
             Ok(())
         })
         .on_window_event(|window, event| {

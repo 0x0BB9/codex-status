@@ -1,6 +1,6 @@
 [package]
 name = "codex-status-floater"
-version = "0.1.1"
+version = "0.1.2"
 description = "A floating Codex status board for rate limits, threads, and local account switching."
 authors = ["Codex Status Floater contributors"]
 edition = "2021"

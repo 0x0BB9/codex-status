@@ -23,6 +23,8 @@ Windows 10/11 x64 版本支持以下功能：
 - 切换后重启官方 Codex/ChatGPT 桌面客户端
 - NSIS `.exe` 和 MSI `.msi` 安装包
 
+Windows 版本使用无边框工具窗口：启动时自动停靠到主屏幕右上侧，不占用任务栏位置，并持续保持置顶。点击右上角“−”会隐藏到系统托盘；托盘图标或 `Ctrl + Alt + Space` 可以再次显示。
+
 ## Codex app-server 探测
 
 浮窗需要启动官方 `codex app-server`。发布安装包会内置与应用一起分发的官方 Codex 原生二进制，Windows 会依次尝试：

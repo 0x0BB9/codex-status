@@ -127,6 +127,8 @@ const FLOATING_RIGHT_DOCK_TOLERANCE = SNAP_EDGE_DISTANCE + 8;
 const FLOATING_PEEK_LOGICAL_SIZE = { width: 82, height: 168 };
 const FLOATING_EXPANDED_MIN_LOGICAL_SIZE = { width: 360, height: 620 };
 const FLOATING_DEFAULT_EXPANDED_LOGICAL_SIZE = { width: 430, height: 860 };
+const IS_WINDOWS =
+  typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
 
 type AppWindow = ReturnType<typeof getCurrentWindow>;
 type MonitorInfo = Awaited<ReturnType<typeof availableMonitors>>[number];
@@ -1415,6 +1417,18 @@ function App() {
     scheduleFloatingIdle();
   });
 
+  const handleHideFloatingWindow = useEffectEvent(async () => {
+    if (!isTauri) {
+      return;
+    }
+
+    try {
+      await getCurrentWindow().hide();
+    } catch {
+      // The tray and global shortcut remain available if hiding is unsupported.
+    }
+  });
+
   const handleOpenAccountLoginUrl = useEffectEvent(async (url?: string) => {
     if (!url) {
       return;
@@ -1902,6 +1916,7 @@ function App() {
   const isPeekMode = floatingMode === "peek";
   const shellClassName = [
     "shell",
+    IS_WINDOWS ? "platform-windows" : null,
     `quota-${globalPrimaryUsage.tone}`,
     `floating-${floatingMode}`,
     isFloatingDimmed ? "floating-dimmed" : null,
@@ -1937,7 +1952,20 @@ function App() {
             {lastSyncAt ? `${formatRelativeTime(lastSyncAt / 1000)}更新` : "等待数据"}
           </p>
         </div>
-        <div className={`status-pill tone-${connectionState}`}>{connectionBadge}</div>
+        <div className="topbar-actions">
+          <div className={`status-pill tone-${connectionState}`}>{connectionBadge}</div>
+          {IS_WINDOWS && isTauri ? (
+            <button
+              aria-label="隐藏到系统托盘"
+              className="window-hide-button"
+              title="隐藏到系统托盘"
+              type="button"
+              onClick={() => void handleHideFloatingWindow()}
+            >
+              −
+            </button>
+          ) : null}
+        </div>
       </header>
 
       <aside className={`quota-ribbon quota-ribbon-${globalPrimaryUsage.tone}`}>
