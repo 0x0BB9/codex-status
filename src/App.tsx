@@ -12,6 +12,7 @@ import {
   PhysicalPosition,
   PhysicalSize,
 } from "@tauri-apps/api/window";
+import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type { PlanType, ServerNotification } from "./generated";
 import type {
@@ -49,6 +50,7 @@ import "./App.css";
 
 type ConnectionState = "disconnected" | "connecting" | "connected" | "error";
 type FloatingMode = "expanded" | "peek";
+type AppTheme = "ember" | "ocean" | "forest" | "coral" | "graphite";
 type ThreadFilter = "all" | "recent" | "idle" | "systemError";
 type ThreadGroupBy = "none" | "project" | "priority" | "stage";
 type AccountLoginFlow = {
@@ -77,6 +79,38 @@ type DashboardClient = {
 const MAX_LOG_LINES = 6;
 const RESTART_CODEX_CLIENT_AFTER_SWITCH_KEY =
   "codex-status-floater.restartCodexClientAfterSwitch";
+const APP_THEME_STORAGE_KEY = "codex-status-floater.theme";
+const APP_THEMES: Array<{
+  id: AppTheme;
+  label: string;
+  swatch: string;
+}> = [
+  {
+    id: "ember",
+    label: "奶油",
+    swatch: "linear-gradient(135deg, #c96f35 0 48%, #fffaf1 48%)",
+  },
+  {
+    id: "ocean",
+    label: "雾蓝",
+    swatch: "linear-gradient(135deg, #397e9d 0 48%, #f9fcfd 48%)",
+  },
+  {
+    id: "forest",
+    label: "鼠尾草",
+    swatch: "linear-gradient(135deg, #4f825a 0 48%, #fbfdf9 48%)",
+  },
+  {
+    id: "coral",
+    label: "蜜桃",
+    swatch: "linear-gradient(135deg, #c96355 0 48%, #fffaf7 48%)",
+  },
+  {
+    id: "graphite",
+    label: "云灰",
+    swatch: "linear-gradient(135deg, #5b6f82 0 48%, #fbfcfd 48%)",
+  },
+];
 const PLAN_TYPE_LABELS: Record<PlanType, string> = {
   free: "免费版",
   go: "Go",
@@ -129,6 +163,10 @@ const FLOATING_EXPANDED_MIN_LOGICAL_SIZE = { width: 360, height: 620 };
 const FLOATING_DEFAULT_EXPANDED_LOGICAL_SIZE = { width: 430, height: 860 };
 const IS_WINDOWS =
   typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
+
+function isAppTheme(value: string | null): value is AppTheme {
+  return APP_THEMES.some((theme) => theme.id === value);
+}
 
 type AppWindow = ReturnType<typeof getCurrentWindow>;
 type MonitorInfo = Awaited<ReturnType<typeof availableMonitors>>[number];
@@ -753,6 +791,16 @@ function getAuthAccountTitle(account: StoredCodexRegistry["accounts"][number]) {
   );
 }
 
+function getAuthAccountEmail(account: StoredCodexRegistry["accounts"][number]) {
+  const email = account.email?.trim();
+  if (!email || email === "API Key") {
+    return null;
+  }
+
+  const title = getAuthAccountTitle(account);
+  return title.toLocaleLowerCase() === email.toLocaleLowerCase() ? null : email;
+}
+
 function normalizeBoardText(value: string | null | undefined) {
   return value?.trim() ?? "";
 }
@@ -869,8 +917,19 @@ function App() {
   const collapseTimerRef = useRef<number | null>(null);
   const dimTimerRef = useRef<number | null>(null);
   const lastExpandedWindowRef = useRef<FloatingWindowSnapshot | null>(null);
+  const suppressPeekHoverUntilRef = useRef(0);
   const [connectionState, setConnectionState] =
     useState<ConnectionState>("disconnected");
+  const [appVersion, setAppVersion] = useState<string | null>(null);
+  const [appTheme, setAppTheme] = useState<AppTheme>(() => {
+    if (typeof window === "undefined") {
+      return "ember";
+    }
+
+    const storedTheme = window.localStorage.getItem(APP_THEME_STORAGE_KEY);
+    return isAppTheme(storedTheme) ? storedTheme : "ember";
+  });
+  const [isThemePickerOpen, setIsThemePickerOpen] = useState(false);
   const serverUrl = DEFAULT_CODEX_WS_URL;
   const [account, setAccount] = useState<Account | null>(null);
   const [rateLimits, setRateLimits] = useState<RateLimitSnapshot[]>([]);
@@ -1408,7 +1467,10 @@ function App() {
     clearFloatingIdleTimers();
     setIsFloatingDimmed(false);
 
-    if (floatingMode === "peek") {
+    if (
+      floatingMode === "peek" &&
+      Date.now() >= suppressPeekHoverUntilRef.current
+    ) {
       void expandFloatingWindow();
     }
   });
@@ -1735,6 +1797,11 @@ function App() {
   }, [restartCodexClientAfterSwitch]);
 
   useEffect(() => {
+    document.documentElement.dataset.theme = appTheme;
+    window.localStorage.setItem(APP_THEME_STORAGE_KEY, appTheme);
+  }, [appTheme]);
+
+  useEffect(() => {
     if (isTauri) {
       void loadAuthAccounts();
       void loadThreadBoard();
@@ -1743,6 +1810,27 @@ function App() {
 
     return () => {
       void disconnectClient();
+    };
+  }, [isTauri]);
+
+  useEffect(() => {
+    if (!isTauri) {
+      return undefined;
+    }
+
+    let disposed = false;
+    void getVersion()
+      .then((version) => {
+        if (!disposed) {
+          setAppVersion(version);
+        }
+      })
+      .catch(() => {
+        // Version display is informational and should not affect the dashboard.
+      });
+
+    return () => {
+      disposed = true;
     };
   }, [isTauri]);
 
@@ -1914,6 +2002,8 @@ function App() {
       });
   })();
   const isPeekMode = floatingMode === "peek";
+  const activeTheme =
+    APP_THEMES.find((theme) => theme.id === appTheme) ?? APP_THEMES[0];
   const shellClassName = [
     "shell",
     IS_WINDOWS ? "platform-windows" : null,
@@ -1946,7 +2036,10 @@ function App() {
         <>
       <header className="topbar" data-tauri-drag-region>
         <div>
-          <p className="eyebrow">Codex 状态</p>
+          <p className="eyebrow">
+            <span>Codex 状态</span>
+            {appVersion ? <span className="app-version">v{appVersion}</span> : null}
+          </p>
           <h1>{describeAccount(account)}</h1>
           <p className="subtitle">
             {lastSyncAt ? `${formatRelativeTime(lastSyncAt / 1000)}更新` : "等待数据"}
@@ -1954,6 +2047,37 @@ function App() {
         </div>
         <div className="topbar-actions">
           <div className={`status-pill tone-${connectionState}`}>{connectionBadge}</div>
+          <button
+            aria-controls="theme-picker"
+            aria-expanded={isThemePickerOpen}
+            className="theme-toggle"
+            title={`当前主题：${activeTheme.label}`}
+            type="button"
+            onClick={() => setIsThemePickerOpen((current) => !current)}
+          >
+            <span
+              aria-hidden="true"
+              className="theme-toggle-swatch"
+              style={{ background: activeTheme.swatch }}
+            />
+            主题
+          </button>
+          {isTauri ? (
+            <button
+              aria-label="切换为悬浮胶囊"
+              className="floating-toggle"
+              title="收起为右侧悬浮胶囊"
+              type="button"
+              onClick={() => {
+                setIsThemePickerOpen(false);
+                suppressPeekHoverUntilRef.current = Date.now() + 800;
+                void collapseFloatingWindow({ force: true });
+              }}
+            >
+              <span aria-hidden="true" className="floating-toggle-icon" />
+              悬浮
+            </button>
+          ) : null}
           {IS_WINDOWS && isTauri ? (
             <button
               aria-label="隐藏到系统托盘"
@@ -1967,6 +2091,38 @@ function App() {
           ) : null}
         </div>
       </header>
+
+      {isThemePickerOpen ? (
+        <section aria-label="界面主题" className="theme-picker" id="theme-picker">
+          <div className="theme-picker-heading">
+            <strong>界面主题</strong>
+            <span>当前：{activeTheme.label}</span>
+          </div>
+          <div className="theme-options">
+            {APP_THEMES.map((theme) => (
+              <button
+                aria-pressed={theme.id === appTheme}
+                className={
+                  theme.id === appTheme ? "theme-option active" : "theme-option"
+                }
+                key={theme.id}
+                type="button"
+                onClick={() => {
+                  setAppTheme(theme.id);
+                  setIsThemePickerOpen(false);
+                }}
+              >
+                <span
+                  aria-hidden="true"
+                  className="theme-option-swatch"
+                  style={{ background: theme.swatch }}
+                />
+                <span>{theme.label}</span>
+              </button>
+            ))}
+          </div>
+        </section>
+      ) : null}
 
       <aside className={`quota-ribbon quota-ribbon-${globalPrimaryUsage.tone}`}>
         <div>
@@ -2154,11 +2310,20 @@ function App() {
               {authAccounts.map((authAccount) => {
                 const isActiveAccount = authAccount.account_key === activeAuthKey;
                 const isSwitching = switchingAccountKey === authAccount.account_key;
+                const accountTitle = getAuthAccountTitle(authAccount);
+                const accountEmail = getAuthAccountEmail(authAccount);
 
                 return (
                   <article className="account-card" key={authAccount.account_key}>
                     <div>
-                      <h3>{getAuthAccountTitle(authAccount)}</h3>
+                      <h3>
+                        <span className="account-title">{accountTitle}</span>
+                        {accountEmail ? (
+                          <span className="account-email" title={accountEmail}>
+                            {accountEmail}
+                          </span>
+                        ) : null}
+                      </h3>
                       <p>
                         {formatAuthPlan(authAccount.plan)} ·{" "}
                         {authAccount.auth_mode ?? "chatgpt"} · 最近使用{" "}
