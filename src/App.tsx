@@ -1132,7 +1132,7 @@ function App() {
 
     try {
       await restartCodexDesktopClient();
-      setCodexClientRestartMessage("已请求重启 Codex 客户端。");
+      setCodexClientRestartMessage("Codex 客户端已重新启动。");
       setLastEvent("codex-client/restarted");
       return true;
     } catch (error) {

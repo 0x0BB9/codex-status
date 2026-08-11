@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 use std::{
     collections::BTreeMap,
     fs,
@@ -10,19 +12,21 @@ use std::{
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+#[cfg(target_os = "windows")]
+use tauri::PhysicalPosition;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Manager, Runtime, WebviewWindow, WindowEvent,
 };
-#[cfg(target_os = "windows")]
-use tauri::PhysicalPosition;
 use tauri_plugin_global_shortcut::ShortcutState;
 use toml_edit::{value, DocumentMut};
 
 const MAIN_WINDOW_LABEL: &str = "main";
 #[cfg(target_os = "macos")]
 const CODEX_DESKTOP_BUNDLE_ID: &str = "com.openai.codex";
+#[cfg(target_os = "macos")]
+const CODEX_DESKTOP_PROCESS_NAMES: [&str; 2] = ["ChatGPT", "Codex"];
 const TRAY_MENU_TOGGLE: &str = "toggle-window";
 const TRAY_MENU_QUIT: &str = "quit";
 #[cfg(target_os = "windows")]
@@ -760,30 +764,149 @@ fn restart_codex_desktop_client() -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn restart_codex_desktop_client_for_platform() -> Result<(), String> {
-    let quit_status = Command::new("osascript")
-        .arg("-e")
-        .arg(format!(
-            r#"tell application id "{CODEX_DESKTOP_BUNDLE_ID}" to quit"#
-        ))
-        .status();
+fn macos_app_bundle_from_executable(executable: &Path) -> Option<PathBuf> {
+    executable
+        .ancestors()
+        .find(|path| path.extension().and_then(|extension| extension.to_str()) == Some("app"))
+        .map(Path::to_path_buf)
+}
 
-    if !matches!(quit_status, Ok(status) if status.success()) {
-        let _ = Command::new("pkill")
-            .args(["-TERM", "-x", "Codex"])
-            .status();
+#[cfg(target_os = "macos")]
+fn running_macos_codex_app_path() -> Option<PathBuf> {
+    for process_name in CODEX_DESKTOP_PROCESS_NAMES {
+        let Ok(pgrep_output) = Command::new("pgrep").args(["-x", process_name]).output() else {
+            continue;
+        };
+
+        for pid in String::from_utf8_lossy(&pgrep_output.stdout).lines() {
+            let Ok(ps_output) = Command::new("ps")
+                .args(["-p", pid.trim(), "-o", "comm="])
+                .output()
+            else {
+                continue;
+            };
+
+            let executable = PathBuf::from(String::from_utf8_lossy(&ps_output.stdout).trim());
+            if let Some(app_path) = macos_app_bundle_from_executable(&executable) {
+                if app_path.is_dir() {
+                    return Some(app_path);
+                }
+            }
+        }
     }
 
-    thread::sleep(Duration::from_millis(1_500));
+    None
+}
 
-    let open_status = Command::new("open")
-        .args(["-b", CODEX_DESKTOP_BUNDLE_ID])
-        .status()
+#[cfg(target_os = "macos")]
+fn installed_macos_codex_app_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(PathBuf::from(&home).join("Applications/Codex.app"));
+        candidates.push(PathBuf::from(home).join("Applications/ChatGPT.app"));
+    }
+    candidates.push(PathBuf::from("/Applications/Codex.app"));
+    candidates.push(PathBuf::from("/Applications/ChatGPT.app"));
+
+    candidates.into_iter().find(|path| path.is_dir())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_codex_desktop_running() -> Option<bool> {
+    let mut probe_available = false;
+
+    for process_name in CODEX_DESKTOP_PROCESS_NAMES {
+        if let Ok(output) = Command::new("pgrep").args(["-x", process_name]).output() {
+            probe_available = true;
+            if output.status.success() {
+                return Some(true);
+            }
+        }
+    }
+
+    probe_available.then_some(false)
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_macos_codex_desktop_state(expected_running: bool, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match macos_codex_desktop_running() {
+            Some(running) if running == expected_running => return true,
+            // If process inspection is unavailable, rely on the open/quit command status.
+            None => return true,
+            _ => {}
+        }
+
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_macos_codex_desktop() {
+    for process_name in CODEX_DESKTOP_PROCESS_NAMES {
+        let _ = Command::new("pkill")
+            .args(["-TERM", "-x", process_name])
+            .status();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn restart_codex_desktop_client_for_platform() -> Result<(), String> {
+    let app_path = running_macos_codex_app_path().or_else(installed_macos_codex_app_path);
+    let was_running = macos_codex_desktop_running().unwrap_or(true);
+
+    if was_running {
+        let quit_succeeded = Command::new("osascript")
+            .arg("-e")
+            .arg(format!(
+                r#"tell application id "{CODEX_DESKTOP_BUNDLE_ID}" to quit"#
+            ))
+            .status()
+            .is_ok_and(|status| status.success());
+
+        if !quit_succeeded {
+            terminate_macos_codex_desktop();
+        }
+
+        if !wait_for_macos_codex_desktop_state(false, Duration::from_secs(8)) {
+            terminate_macos_codex_desktop();
+            if !wait_for_macos_codex_desktop_state(false, Duration::from_secs(4)) {
+                return Err("Codex desktop client did not finish quitting on macOS.".to_string());
+            }
+        }
+    }
+
+    let mut open_command = Command::new("open");
+    open_command.arg("-n");
+    let launch_target = if let Some(path) = &app_path {
+        open_command.arg(path);
+        path.display().to_string()
+    } else {
+        open_command.args(["-b", CODEX_DESKTOP_BUNDLE_ID]);
+        format!("bundle id {CODEX_DESKTOP_BUNDLE_ID}")
+    };
+
+    let open_output = open_command
+        .output()
         .map_err(|error| format!("Unable to open Codex desktop client: {error}"))?;
 
-    if !open_status.success() {
+    if !open_output.status.success() {
+        let stderr = String::from_utf8_lossy(&open_output.stderr)
+            .trim()
+            .to_string();
         return Err(format!(
-            "Unable to open Codex desktop client with bundle id {CODEX_DESKTOP_BUNDLE_ID}."
+            "Unable to open Codex desktop client from {launch_target}: {stderr}"
+        ));
+    }
+
+    if !wait_for_macos_codex_desktop_state(true, Duration::from_secs(15)) {
+        return Err(format!(
+            "macOS accepted the launch request for {launch_target}, but the Codex desktop process did not start."
         ));
     }
 
@@ -891,6 +1014,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::configure_file_auth_credentials_store;
+    #[cfg(target_os = "macos")]
+    use super::macos_app_bundle_from_executable;
+    #[cfg(target_os = "macos")]
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn adds_file_auth_store_without_removing_existing_config() {
@@ -922,5 +1049,15 @@ mod tests {
 
         assert!(changed);
         assert_eq!(updated, "cli_auth_credentials_store = \"file\"\n");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolves_macos_app_bundle_from_executable() {
+        let executable = Path::new("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT");
+        assert_eq!(
+            macos_app_bundle_from_executable(executable),
+            Some(PathBuf::from("/Applications/ChatGPT.app"))
+        );
     }
 }

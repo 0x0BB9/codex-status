@@ -65,7 +65,7 @@
 
 如果打开了“账号变更后自动重启 Codex 客户端”，工具会在目标账号验证成功后重启官方 Codex 桌面客户端。也可以在账号面板里点击“立即重启 Codex 客户端”手动触发。
 
-macOS 会通过 bundle id `com.openai.codex` 退出并重新打开官方客户端。Windows 会从开始菜单应用注册信息中查找 Codex/ChatGPT，终止对应进程后重新启动注册的桌面应用。
+macOS 会通过 bundle id `com.openai.codex` 请求官方客户端退出，等待 `ChatGPT`/`Codex` 主进程真正结束后，再从实际 App 路径启动一个新实例并验证进程已经恢复。Windows 会从开始菜单应用注册信息中查找 Codex/ChatGPT，终止对应进程后重新启动注册的桌面应用。
 
 已经运行中的其他 Codex CLI 或 VS Code 扩展不会自动切换账号；它们通常需要重启或重新连接后才会读取新的 `auth.json`。
 
