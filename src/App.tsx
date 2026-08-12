@@ -917,7 +917,6 @@ function App() {
   const collapseTimerRef = useRef<number | null>(null);
   const dimTimerRef = useRef<number | null>(null);
   const lastExpandedWindowRef = useRef<FloatingWindowSnapshot | null>(null);
-  const suppressPeekHoverUntilRef = useRef(0);
   const [connectionState, setConnectionState] =
     useState<ConnectionState>("disconnected");
   const [appVersion, setAppVersion] = useState<string | null>(null);
@@ -1400,14 +1399,12 @@ function App() {
         availableMonitors(),
       ]);
       const snapshot = lastExpandedWindowRef.current;
-      const fallbackSize = snapshot?.size ?? {
-        height: size.height,
-        width: size.width,
-      };
+      // Use the capsule's real bounds so a docked window cannot be assigned to
+      // the adjacent display merely because its expanded width crosses the seam.
       const monitor = getNearestMonitor(
         position,
-        fallbackSize.width,
-        fallbackSize.height,
+        size.width,
+        size.height,
         monitors,
       );
 
@@ -1466,13 +1463,6 @@ function App() {
   const handleFloatingMouseEnter = useEffectEvent(() => {
     clearFloatingIdleTimers();
     setIsFloatingDimmed(false);
-
-    if (
-      floatingMode === "peek" &&
-      Date.now() >= suppressPeekHoverUntilRef.current
-    ) {
-      void expandFloatingWindow();
-    }
   });
 
   const handleFloatingMouseLeave = useEffectEvent(() => {
@@ -2022,8 +2012,9 @@ function App() {
     >
       {isPeekMode ? (
         <button
-          aria-label="展开 Codex 状态浮窗"
+          aria-label="点击展开 Codex 状态浮窗"
           className={`peek-capsule peek-${globalPrimaryUsage.tone}`}
+          title="点击展开状态看板"
           type="button"
           onClick={() => void expandFloatingWindow()}
         >
@@ -2070,7 +2061,6 @@ function App() {
               type="button"
               onClick={() => {
                 setIsThemePickerOpen(false);
-                suppressPeekHoverUntilRef.current = Date.now() + 800;
                 void collapseFloatingWindow({ force: true });
               }}
             >

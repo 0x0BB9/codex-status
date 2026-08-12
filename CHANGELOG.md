@@ -6,6 +6,16 @@
 
 暂无。
 
+## [0.1.9] - 2026-08-12
+
+### 改进
+
+- 悬浮胶囊改为仅点击展开，鼠标经过时只保留视觉提示，避免误触打断当前工作。
+
+### 修复
+
+- 修复 Windows 多屏环境中，靠近显示器边界的悬浮胶囊可能跑到相邻屏幕展开的问题。
+
 ## [0.1.8] - 2026-08-11
 
 ### 改进
@@ -72,5 +82,6 @@
 - 账号凭据只保存在用户本机的 `~/.codex` 目录，不写入仓库或安装包。
 - 切换账号前备份当前鉴权文件，验证失败时自动恢复原账号。
 
+[0.1.9]: https://github.com/0x0BB9/codex-status/releases/tag/v0.1.9
 [0.1.8]: https://github.com/0x0BB9/codex-status/releases/tag/v0.1.8
 [0.1.7]: https://github.com/0x0BB9/codex-status/releases/tag/v0.1.7

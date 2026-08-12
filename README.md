@@ -19,7 +19,7 @@ Packaged builds include the official Codex native binary as a local sidecar, so 
 - local task board metadata: pinned threads, notes, project, priority, and stage
 - live status notifications such as `thread/status/changed`
 - tray menu controls, a global window toggle, transparent floating, and edge snapping
-- right-edge auto-collapse into a small usage capsule with hover-to-expand
+- right-edge auto-collapse into a small usage capsule with click-to-expand
 - a tiny local server log when the app launches `codex app-server` itself
 
 ## Account Switching
