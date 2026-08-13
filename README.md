@@ -20,6 +20,7 @@ Packaged builds include the official Codex native binary as a local sidecar, so 
 - live status notifications such as `thread/status/changed`
 - tray menu controls, a global window toggle, transparent floating, and edge snapping
 - right-edge auto-collapse into a small usage capsule with click-to-expand
+- in-app update checks with Windows install/relaunch and macOS Release links
 - a tiny local server log when the app launches `codex app-server` itself
 
 ## Account Switching
@@ -52,6 +53,14 @@ See [docs/thread-board.md](docs/thread-board.md) for the storage location and fi
 For packaging and sharing the app with other users, see [docs/distribution.md](docs/distribution.md). Windows-specific behavior and build instructions are in [docs/windows.md](docs/windows.md).
 
 Release notes and version history are available in [CHANGELOG.md](CHANGELOG.md).
+
+## App Updates
+
+Click the version badge in the header to check for updates. The app also performs one silent check after startup.
+
+- Windows downloads and installs signed updater artifacts in-app, then relaunches.
+- macOS opens the matching GitHub Release when a newer version is available.
+- v0.1.10 and older builds do not contain the updater client, so they must be upgraded to v0.1.11 manually once.
 
 ## Local Web Preview
 

@@ -695,6 +695,7 @@ code {
 }
 
 .app-version {
+  min-height: 0;
   border: 1px solid rgba(var(--accent-rgb), 0.34);
   border-radius: 999px;
   padding: 0.06rem 0.32rem;
@@ -705,6 +706,75 @@ code {
   letter-spacing: 0.03em;
   line-height: 1.25;
   text-transform: none;
+}
+
+.app-version:hover,
+.app-version.update-current {
+  border-color: rgba(var(--accent-rgb), 0.62);
+  color: var(--accent-soft);
+  background: rgba(var(--accent-rgb), 0.16);
+}
+
+.app-version.update-available {
+  border-color: rgba(var(--ok-rgb), 0.62);
+  color: var(--ok);
+  background: rgba(var(--ok-rgb), 0.13);
+  box-shadow: 0 0 0 2px rgba(var(--ok-rgb), 0.08);
+}
+
+.app-version.update-error {
+  border-color: rgba(var(--danger-rgb), 0.5);
+  color: var(--danger);
+  background: rgba(var(--danger-rgb), 0.1);
+}
+
+.app-version.update-downloading,
+.app-version.update-installing {
+  border-color: rgba(var(--info-rgb), 0.5);
+  color: var(--info);
+  background: rgba(var(--info-rgb), 0.1);
+}
+
+.update-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  border: 1px solid rgba(var(--info-rgb), 0.4);
+  border-radius: 8px;
+  padding: 0.65rem 0.7rem;
+  background:
+    linear-gradient(105deg, rgba(var(--info-rgb), 0.13), transparent 70%),
+    rgba(var(--panel-rgb), 0.96);
+  box-shadow: 0 8px 20px rgba(49, 43, 35, 0.1);
+}
+
+.update-banner > div {
+  min-width: 0;
+}
+
+.update-banner strong {
+  font-size: 0.85rem;
+}
+
+.update-banner p {
+  margin: 0.12rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.74rem;
+}
+
+.update-banner button {
+  flex: 0 0 auto;
+  min-height: 32px;
+  padding: 0.35rem 0.65rem;
+  font-size: 0.76rem;
+}
+
+.update-banner-error {
+  border-color: rgba(var(--danger-rgb), 0.46);
+  background:
+    linear-gradient(105deg, rgba(var(--danger-rgb), 0.12), transparent 70%),
+    rgba(var(--panel-rgb), 0.96);
 }
 
 .subtitle,

@@ -72,6 +72,19 @@ src-tauri\target\release\bundle\msi\*.msi
 
 GitHub 仓库的 `Build Windows` 工作流支持手动触发，也会在推送 `v*` 标签时构建并上传安装包 artifact。
 
+## 应用更新与签名密钥
+
+Windows 使用 Tauri updater 在应用内下载和安装更新；macOS 使用同一份 `latest.json` 检查版本，但会跳转 GitHub Release 手动下载。
+
+- 本机长期私钥默认保存在 `~/.tauri/codex-status-floater.key`，权限应保持为 `600`。
+- 公钥已经写入 `src-tauri/tauri.conf.json`，可以公开提交。
+- GitHub Actions 必须配置仓库 Secret `TAURI_SIGNING_PRIVATE_KEY`，值为私钥文件的完整内容。
+- 当前私钥没有密码，工作流会显式传入空的 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`，避免 CI 尝试弹出交互提示。
+- 私钥不能提交到 Git、Release、Actions Artifact 或日志，也不能在后续版本中重新生成替换。
+- 如果私钥丢失，已经安装的客户端将无法验证后续自动更新。
+
+`Publish Release` 工作流会生成普通 DMG/EXE/MSI、更新专用产物、`.sig`、`latest.json` 和 `SHA256SUMS.txt`。其中 `.sig` 是应用安装前强制验证的更新签名，`SHA256SUMS.txt` 只用于人工校验，二者不能互相替代。
+
 ## 分发前检查
 
 发布前至少确认：

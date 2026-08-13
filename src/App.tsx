@@ -14,6 +14,8 @@ import {
 } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 import type { PlanType, ServerNotification } from "./generated";
 import type {
   Account,
@@ -63,6 +65,20 @@ type AppTheme =
   | "graphite";
 type ThreadFilter = "all" | "recent" | "idle" | "systemError";
 type ThreadGroupBy = "none" | "project" | "priority" | "stage";
+type AppUpdatePhase =
+  | "idle"
+  | "checking"
+  | "available"
+  | "downloading"
+  | "installing"
+  | "current"
+  | "error";
+type AppUpdateState = {
+  error: string | null;
+  phase: AppUpdatePhase;
+  progress: number | null;
+  version: string | null;
+};
 type AccountLoginFlow = {
   authUrl?: string;
   loginId: string;
@@ -181,9 +197,22 @@ const FLOATING_EXPANDED_MIN_LOGICAL_SIZE = { width: 360, height: 620 };
 const FLOATING_DEFAULT_EXPANDED_LOGICAL_SIZE = { width: 430, height: 860 };
 const IS_WINDOWS =
   typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
+const IS_MACOS =
+  typeof navigator !== "undefined" && navigator.userAgent.includes("Macintosh");
+const RELEASE_URL = "https://github.com/0x0BB9/codex-status/releases";
+const INITIAL_APP_UPDATE_STATE: AppUpdateState = {
+  error: null,
+  phase: "idle",
+  progress: null,
+  version: null,
+};
 
 function isAppTheme(value: string | null): value is AppTheme {
   return APP_THEMES.some((theme) => theme.id === value);
+}
+
+function getReleaseUrl(version: string) {
+  return `${RELEASE_URL}/tag/v${version.replace(/^v/, "")}`;
 }
 
 type AppWindow = ReturnType<typeof getCurrentWindow>;
@@ -974,6 +1003,8 @@ function getThreadGroupSortValue(label: string, metadata: ThreadBoardMetadata, g
 
 function App() {
   const clientRef = useRef<DashboardClient | null>(null);
+  const appUpdateRef = useRef<Update | null>(null);
+  const isCheckingForUpdateRef = useRef(false);
   const collapseTimerRef = useRef<number | null>(null);
   const dimTimerRef = useRef<number | null>(null);
   const lastExpandedWindowRef = useRef<FloatingWindowSnapshot | null>(null);
@@ -982,6 +1013,9 @@ function App() {
   const [connectionState, setConnectionState] =
     useState<ConnectionState>("disconnected");
   const [appVersion, setAppVersion] = useState<string | null>(null);
+  const [appUpdate, setAppUpdate] = useState<AppUpdateState>(
+    INITIAL_APP_UPDATE_STATE,
+  );
   const [appTheme, setAppTheme] = useState<AppTheme>(() => {
     if (typeof window === "undefined") {
       return "ember";
@@ -1596,6 +1630,132 @@ function App() {
     }
   });
 
+  const checkForAppUpdate = useEffectEvent(
+    async (options: { silent?: boolean } = {}) => {
+      if (!isTauri || isCheckingForUpdateRef.current) {
+        return;
+      }
+
+      isCheckingForUpdateRef.current = true;
+      if (!options.silent) {
+        setAppUpdate((current) => ({
+          ...current,
+          error: null,
+          phase: "checking",
+          progress: null,
+        }));
+      }
+
+      try {
+        if (appUpdateRef.current) {
+          await appUpdateRef.current.close();
+          appUpdateRef.current = null;
+        }
+
+        const update = await check({ timeout: 15_000 });
+        if (!update) {
+          setAppUpdate({
+            error: null,
+            phase: options.silent ? "idle" : "current",
+            progress: null,
+            version: null,
+          });
+          return;
+        }
+
+        if (IS_WINDOWS) {
+          appUpdateRef.current = update;
+        } else {
+          await update.close();
+        }
+
+        setAppUpdate({
+          error: null,
+          phase: "available",
+          progress: null,
+          version: update.version,
+        });
+      } catch (error) {
+        if (!options.silent) {
+          setAppUpdate({
+            error: getErrorMessage(error, "检查更新失败，请稍后重试。"),
+            phase: "error",
+            progress: null,
+            version: null,
+          });
+        }
+      } finally {
+        isCheckingForUpdateRef.current = false;
+      }
+    },
+  );
+
+  const handleAppUpdate = useEffectEvent(async () => {
+    if (appUpdate.phase !== "available" || !appUpdate.version) {
+      await checkForAppUpdate();
+      return;
+    }
+
+    if (IS_MACOS) {
+      try {
+        await openUrl(getReleaseUrl(appUpdate.version));
+      } catch (error) {
+        setAppUpdate((current) => ({
+          ...current,
+          error: getErrorMessage(error, "无法打开新版下载页面。"),
+          phase: "error",
+        }));
+      }
+      return;
+    }
+
+    const update = appUpdateRef.current;
+    if (!IS_WINDOWS || !update) {
+      await checkForAppUpdate();
+      return;
+    }
+
+    let downloaded = 0;
+    let total: number | null = null;
+    setAppUpdate((current) => ({
+      ...current,
+      error: null,
+      phase: "downloading",
+      progress: 0,
+    }));
+
+    try {
+      await update.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          total = event.data.contentLength ?? null;
+          return;
+        }
+
+        if (event.event === "Progress") {
+          downloaded += event.data.chunkLength;
+          const progress = total
+            ? Math.min(100, Math.round((downloaded / total) * 100))
+            : null;
+          setAppUpdate((current) => ({ ...current, progress }));
+          return;
+        }
+
+        setAppUpdate((current) => ({
+          ...current,
+          phase: "installing",
+          progress: 100,
+        }));
+      });
+      await relaunch();
+    } catch (error) {
+      setAppUpdate((current) => ({
+        ...current,
+        error: getErrorMessage(error, "新版安装失败，请重试。"),
+        phase: "error",
+      }));
+    }
+  });
+
   const handleOpenAccountLoginUrl = useEffectEvent(async (url?: string) => {
     if (!url) {
       return;
@@ -1952,6 +2112,24 @@ function App() {
       return undefined;
     }
 
+    const timer = window.setTimeout(() => {
+      void checkForAppUpdate({ silent: true });
+    }, 2_000);
+
+    return () => {
+      window.clearTimeout(timer);
+      if (appUpdateRef.current) {
+        void appUpdateRef.current.close();
+        appUpdateRef.current = null;
+      }
+    };
+  }, [isTauri]);
+
+  useEffect(() => {
+    if (!isTauri) {
+      return undefined;
+    }
+
     const appWindow = getCurrentWindow();
     let disposed = false;
     let isSnapping = false;
@@ -2155,7 +2333,37 @@ function App() {
         <div>
           <p className="eyebrow">
             <span>Codex 状态</span>
-            {appVersion ? <span className="app-version">v{appVersion}</span> : null}
+            {appVersion ? (
+              <button
+                className={`app-version update-${appUpdate.phase}`}
+                disabled={
+                  appUpdate.phase === "checking" ||
+                  appUpdate.phase === "downloading" ||
+                  appUpdate.phase === "installing"
+                }
+                title={
+                  appUpdate.phase === "available"
+                    ? `发现 v${appUpdate.version}，点击${IS_WINDOWS ? "更新" : "下载"}`
+                    : appUpdate.error ?? "点击检查更新"
+                }
+                type="button"
+                onClick={() => void handleAppUpdate()}
+              >
+                {appUpdate.phase === "checking"
+                  ? "检查中"
+                  : appUpdate.phase === "available"
+                    ? `有新版 v${appUpdate.version}`
+                    : appUpdate.phase === "downloading"
+                      ? appUpdate.progress === null
+                        ? "下载中"
+                        : `下载 ${appUpdate.progress}%`
+                      : appUpdate.phase === "installing"
+                        ? "安装中"
+                        : appUpdate.phase === "current"
+                          ? `v${appVersion} 最新`
+                          : `v${appVersion}`}
+              </button>
+            ) : null}
           </p>
           <h1>{describeAccount(account)}</h1>
           <p className="subtitle">
@@ -2237,6 +2445,47 @@ function App() {
               </button>
             ))}
           </div>
+        </section>
+      ) : null}
+
+      {appUpdate.phase === "available" ||
+      appUpdate.phase === "downloading" ||
+      appUpdate.phase === "installing" ||
+      appUpdate.phase === "error" ? (
+        <section className={`update-banner update-banner-${appUpdate.phase}`}>
+          <div>
+            <strong>
+              {appUpdate.phase === "available"
+                ? `Codex 状态 v${appUpdate.version}`
+                : appUpdate.phase === "downloading"
+                  ? "正在下载新版"
+                  : appUpdate.phase === "installing"
+                    ? "正在安装新版"
+                    : "更新暂未完成"}
+            </strong>
+            <p>
+              {appUpdate.error
+                ? appUpdate.error
+                : appUpdate.phase === "available"
+                  ? IS_WINDOWS
+                    ? "可以直接在应用内下载、安装并自动重启。"
+                    : "macOS 将打开 GitHub Release 下载页面。"
+                  : appUpdate.phase === "downloading"
+                    ? appUpdate.progress === null
+                      ? "正在获取安装包，请保持网络连接。"
+                      : `安装包已下载 ${appUpdate.progress}%。`
+                    : "安装程序即将接管，应用会自动重新启动。"}
+            </p>
+          </div>
+          {appUpdate.phase === "available" || appUpdate.phase === "error" ? (
+            <button className="primary" type="button" onClick={() => void handleAppUpdate()}>
+              {appUpdate.phase === "error"
+                ? "重试"
+                : IS_WINDOWS
+                  ? "立即更新"
+                  : "前往下载"}
+            </button>
+          ) : null}
         </section>
       ) : null}
 

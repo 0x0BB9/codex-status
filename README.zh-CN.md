@@ -20,6 +20,7 @@ Codex Status Floater 是一个基于 Tauri 的轻量悬浮状态看板，主要�
 - 支持系统托盘、全局快捷键、透明悬浮和拖拽吸边
 - 停靠到屏幕右侧后自动收起为额度胶囊；鼠标经过不会打扰，点击胶囊才恢复完整看板
 - 提供多套浅色主题，并记住用户选择
+- Windows 支持应用内检查、下载和安装新版；macOS 检查到新版后跳转对应 Release
 - 启动本地 `codex app-server` 时显示精简运行日志
 
 ## 账号切换
@@ -52,6 +53,15 @@ Codex Status Floater 是一个基于 Tauri 的轻量悬浮状态看板，主要�
 macOS App/DMG 和 Windows NSIS/MSI 的构建、签名及分发说明见 [打包分发文档](docs/distribution.md)。Windows 平台的行为差异和构建步骤见 [Windows 文档](docs/windows.md)。
 
 版本变化见 [更新日志](CHANGELOG.md)。
+
+## 应用更新
+
+点击页面顶部的版本号可以手动检查更新，应用启动后也会静默检查一次。
+
+- Windows 检查到新版后，可以在应用内下载安装，安装完成后自动重启。
+- macOS 检查到新版后，会打开该版本的 GitHub Release 下载页面。
+- 更新包使用独立的 Tauri 签名进行完整性验证；该签名与 Windows 发布者证书、macOS Developer ID 是不同的安全机制。
+- v0.1.10 及更早版本尚未内置更新客户端，需要手动安装 v0.1.11；之后才能使用应用内更新。
 
 ## 本地网页预览
 

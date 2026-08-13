@@ -6,6 +6,19 @@
 
 暂无。
 
+## [0.1.11] - 2026-08-13
+
+### 新增
+
+- Windows 支持在应用内检查、下载并安装新版，完成后自动重启。
+- macOS 支持检查新版，并直接打开对应的 GitHub Release 下载页面。
+- 版本号改为可点击的更新入口；发现新版后会显示独立提示和下载进度。
+
+### 发布
+
+- Release 工作流生成经过 Tauri 签名验证的更新包、签名文件和 `latest.json`。
+- 更新签名私钥仅保存在本机安全目录与 GitHub Actions Secret，不进入仓库或安装包。
+
 ## [0.1.10] - 2026-08-13
 
 ### 新增
@@ -94,6 +107,7 @@
 - 账号凭据只保存在用户本机的 `~/.codex` 目录，不写入仓库或安装包。
 - 切换账号前备份当前鉴权文件，验证失败时自动恢复原账号。
 
+[0.1.11]: https://github.com/0x0BB9/codex-status/releases/tag/v0.1.11
 [0.1.10]: https://github.com/0x0BB9/codex-status/releases/tag/v0.1.10
 [0.1.9]: https://github.com/0x0BB9/codex-status/releases/tag/v0.1.9
 [0.1.8]: https://github.com/0x0BB9/codex-status/releases/tag/v0.1.8

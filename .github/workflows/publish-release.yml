@@ -18,6 +18,9 @@ concurrency:
 jobs:
   build-windows:
     runs-on: windows-latest
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -41,10 +44,15 @@ jobs:
           if-no-files-found: error
           path: |
             src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.exe.sig
             src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/msi/*.msi.sig
 
   build-macos:
     runs-on: macos-latest
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -68,7 +76,10 @@ jobs:
         with:
           name: release-macos
           if-no-files-found: error
-          path: src-tauri/target/release/bundle/dmg/*_aarch64_adhoc.dmg
+          path: |
+            src-tauri/target/release/bundle/dmg/*_aarch64_adhoc.dmg
+            src-tauri/target/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/release/bundle/macos/*.app.tar.gz.sig
 
   publish:
     needs:
@@ -96,8 +107,9 @@ jobs:
           notes=".github/release-notes/${tag}.md"
           test -f "$notes"
           mkdir -p release
-          find packages -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' \) -exec cp {} release/ \;
-          test "$(find release -type f | wc -l | tr -d ' ')" -ge 3
+          find packages -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' -o -name '*.sig' -o -name '*.tar.gz' \) -exec cp {} release/ \;
+          node scripts/generate-updater-manifest.mjs release
+          test "$(find release -type f | wc -l | tr -d ' ')" -ge 8
           (cd release && sha256sum -- * > SHA256SUMS.txt)
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"

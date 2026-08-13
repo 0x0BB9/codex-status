@@ -1,7 +1,7 @@
 {
   "name": "codex-status-floater",
   "private": true,
-  "version": "0.1.10",
+  "version": "0.1.11",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -16,13 +16,15 @@
     "tauri:dev": "tauri dev",
     "windows:build": "tauri build --bundles nsis,msi",
     "mac:sign:adhoc": "codesign --force --deep --sign - 'src-tauri/target/release/bundle/macos/Codex Status Floater.app'",
-    "mac:dmg:adhoc": "mkdir -p 'src-tauri/target/release/bundle/dmg' && hdiutil create -volname 'Codex Status Floater' -srcfolder 'src-tauri/target/release/bundle/macos/Codex Status Floater.app' -ov -format UDZO 'src-tauri/target/release/bundle/dmg/Codex Status Floater_0.1.10_aarch64_adhoc.dmg'",
+    "mac:dmg:adhoc": "mkdir -p 'src-tauri/target/release/bundle/dmg' && hdiutil create -volname 'Codex Status Floater' -srcfolder 'src-tauri/target/release/bundle/macos/Codex Status Floater.app' -ov -format UDZO 'src-tauri/target/release/bundle/dmg/Codex Status Floater_0.1.11_aarch64_adhoc.dmg'",
     "mac:package:adhoc": "pnpm tauri:build && pnpm mac:sign:adhoc && pnpm mac:dmg:adhoc"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-shell": "^2.3.5",
+    "@tauri-apps/plugin-updater": "^2.10.1",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },
