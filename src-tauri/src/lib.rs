@@ -1,3 +1,4 @@
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 #[cfg(unix)]
@@ -29,6 +30,9 @@ const CODEX_DESKTOP_BUNDLE_ID: &str = "com.openai.codex";
 const CODEX_DESKTOP_PROCESS_NAMES: [&str; 2] = ["ChatGPT", "Codex"];
 const TRAY_MENU_TOGGLE: &str = "toggle-window";
 const TRAY_MENU_QUIT: &str = "quit";
+const RESET_CREDITS_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+const MAX_AUTH_BYTES: u64 = 256 * 1024;
+const MAX_QUOTA_RESPONSE_BYTES: u64 = 1024 * 1024;
 #[cfg(target_os = "windows")]
 const GLOBAL_SHORTCUT: &str = "Ctrl+Alt+Space";
 #[cfg(not(target_os = "windows"))]
@@ -79,6 +83,19 @@ struct AuthStorageConfigResult {
     backup_path: Option<String>,
     changed: bool,
     config_path: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetCreditsSnapshot {
+    available_count: Option<u64>,
+    expires_at: Vec<String>,
+    updated_at_ms: i64,
+}
+
+struct ResetCreditsAuth {
+    access_token: String,
+    account_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -238,6 +255,11 @@ fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
 
 fn read_auth_file(path: &Path) -> Result<Value, String> {
     harden_private_file(path)?;
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("Unable to inspect {}: {error}", path.display()))?;
+    if !metadata.is_file() || metadata.len() > MAX_AUTH_BYTES {
+        return Err("Codex auth file is unavailable or unexpectedly large.".to_string());
+    }
     let content = fs::read_to_string(path)
         .map_err(|error| format!("Unable to read {}: {error}", path.display()))?;
 
@@ -320,6 +342,215 @@ fn value_string<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
     }
 
     current.as_str()
+}
+
+fn pick_string<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| value.get(*key)?.as_str())
+}
+
+fn reset_credits_auth(auth: &Value) -> Result<ResetCreditsAuth, String> {
+    let tokens = auth.get("tokens").unwrap_or(auth);
+    let access_token = pick_string(tokens, &["access_token", "accessToken"])
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "请先登录 ChatGPT/Codex 账号。".to_string())?
+        .to_string();
+    let account_id = pick_string(tokens, &["account_id", "accountId"])
+        .map(str::to_string)
+        .or_else(|| {
+            jwt_payload(Some(&access_token)).and_then(|payload| {
+                pick_string(
+                    &payload,
+                    &[
+                        "https://api.openai.com/auth.chatgpt_account_id",
+                        "chatgpt_account_id",
+                    ],
+                )
+                .map(str::to_string)
+            })
+        });
+
+    Ok(ResetCreditsAuth {
+        access_token,
+        account_id,
+    })
+}
+
+fn reset_credits_headers(auth: &ResetCreditsAuth) -> Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    let mut bearer = HeaderValue::from_str(&format!("Bearer {}", auth.access_token))
+        .map_err(|_| "Codex 登录信息无效。".to_string())?;
+    bearer.set_sensitive(true);
+    headers.insert(AUTHORIZATION, bearer);
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert("originator", HeaderValue::from_static("Codex Desktop"));
+    headers.insert("OAI-Product-Sku", HeaderValue::from_static("CODEX"));
+
+    if let Some(account_id) = &auth.account_id {
+        let mut value =
+            HeaderValue::from_str(account_id).map_err(|_| "Codex 账号标识无效。".to_string())?;
+        value.set_sensitive(true);
+        headers.insert("ChatGPT-Account-Id", value);
+    }
+
+    Ok(headers)
+}
+
+fn unsigned_integer(value: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| {
+        let value = value.get(*key)?;
+        value
+            .as_u64()
+            .or_else(|| value.as_i64().and_then(|item| u64::try_from(item).ok()))
+    })
+}
+
+fn reset_credit_expiration(value: &Value) -> Option<String> {
+    for key in [
+        "expires_at",
+        "expiresAt",
+        "expiration_time",
+        "expirationTime",
+        "expires",
+    ] {
+        let Some(item) = value.get(key) else {
+            continue;
+        };
+        if let Some(text) = item.as_str() {
+            return Some(text.to_string());
+        }
+        if let Some(seconds) = item.as_i64() {
+            return Some(seconds.to_string());
+        }
+        if let Some(seconds) = item.as_u64() {
+            return Some(seconds.to_string());
+        }
+    }
+
+    None
+}
+
+fn collect_reset_credit_expirations(value: &Value) -> Vec<String> {
+    fn visit(value: &Value, output: &mut Vec<String>) {
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    visit(item, output);
+                }
+            }
+            Value::Object(map) => {
+                if let Some(expiration) = reset_credit_expiration(value) {
+                    output.push(expiration);
+                }
+                for key in [
+                    "credits",
+                    "reset_credits",
+                    "resetCredits",
+                    "available",
+                    "items",
+                    "grants",
+                ] {
+                    if let Some(child) = map.get(key) {
+                        visit(child, output);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut expirations = Vec::new();
+    visit(value, &mut expirations);
+    expirations.sort();
+    expirations.dedup();
+    expirations
+}
+
+fn parse_reset_credits(value: &Value) -> ResetCreditsSnapshot {
+    let nested = value
+        .get("rate_limit_reset_credits")
+        .or_else(|| value.get("rateLimitResetCredits"));
+    let available_count = unsigned_integer(
+        value,
+        &[
+            "available_count",
+            "availableCount",
+            "remaining",
+            "count",
+            "quantity",
+        ],
+    )
+    .or_else(|| {
+        nested.and_then(|value| {
+            unsigned_integer(
+                value,
+                &[
+                    "available_count",
+                    "availableCount",
+                    "remaining",
+                    "count",
+                    "quantity",
+                ],
+            )
+        })
+    });
+
+    ResetCreditsSnapshot {
+        available_count,
+        expires_at: collect_reset_credit_expirations(nested.unwrap_or(value)),
+        updated_at_ms: now_unix_millis(),
+    }
+}
+
+async fn limited_json(mut response: reqwest::Response) -> Result<Value, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_QUOTA_RESPONSE_BYTES)
+    {
+        return Err("重置次数响应过大。".to_string());
+    }
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "读取重置次数响应失败。".to_string())?
+    {
+        if bytes.len().saturating_add(chunk.len()) as u64 > MAX_QUOTA_RESPONSE_BYTES {
+            return Err("重置次数响应过大。".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice(&bytes).map_err(|_| "重置次数响应格式已变化。".to_string())
+}
+
+#[tauri::command]
+async fn read_codex_reset_credits() -> Result<ResetCreditsSnapshot, String> {
+    let auth_path = active_auth_path()?;
+    let auth_value = read_auth_file(&auth_path).map_err(|_| "请先登录 ChatGPT/Codex 账号。")?;
+    let auth = reset_credits_auth(&auth_value)?;
+    let headers = reset_credits_headers(&auth)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("CodexStatusFloater/0.1")
+        .build()
+        .map_err(|_| "无法初始化重置次数请求。".to_string())?;
+    let response = client
+        .get(RESET_CREDITS_URL)
+        .headers(headers)
+        .send()
+        .await
+        .map_err(|_| "暂时无法连接额度服务。".to_string())?;
+
+    let snapshot = match response.status().as_u16() {
+        200..=299 => parse_reset_credits(&limited_json(response).await?),
+        401 | 403 => return Err("Codex 登录已失效，请重新登录。".to_string()),
+        429 => return Err("额度服务请求频繁，稍后会自动重试。".to_string()),
+        _ => return Err("额度服务暂时不可用。".to_string()),
+    };
+
+    Ok(snapshot)
 }
 
 fn stable_hash(input: &str) -> String {
@@ -1004,6 +1235,7 @@ pub fn run() {
             save_current_codex_account,
             switch_local_codex_account,
             restart_codex_desktop_client,
+            read_codex_reset_credits,
             list_thread_board_metadata,
             set_thread_board_metadata
         ])
@@ -1013,9 +1245,9 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::configure_file_auth_credentials_store;
     #[cfg(target_os = "macos")]
     use super::macos_app_bundle_from_executable;
+    use super::{configure_file_auth_credentials_store, parse_reset_credits, reset_credits_auth};
     #[cfg(target_os = "macos")]
     use std::path::{Path, PathBuf};
 
@@ -1049,6 +1281,39 @@ mod tests {
 
         assert!(changed);
         assert_eq!(updated, "cli_auth_credentials_store = \"file\"\n");
+    }
+
+    #[test]
+    fn parses_reset_credit_count_and_unique_expirations() {
+        let value = serde_json::json!({
+            "available_count": 2,
+            "credits": [
+                { "expires_at": "2026-08-20T00:00:00Z" },
+                { "expirationTime": 1787270400 },
+                { "expires_at": "2026-08-20T00:00:00Z" }
+            ]
+        });
+        let snapshot = parse_reset_credits(&value);
+
+        assert_eq!(snapshot.available_count, Some(2));
+        assert_eq!(
+            snapshot.expires_at,
+            vec!["1787270400".to_string(), "2026-08-20T00:00:00Z".to_string()]
+        );
+    }
+
+    #[test]
+    fn reads_reset_credit_auth_without_persisting_it() {
+        let auth = serde_json::json!({
+            "tokens": {
+                "access_token": "header.payload.signature",
+                "account_id": "account-123"
+            }
+        });
+        let parsed = reset_credits_auth(&auth).expect("auth should parse");
+
+        assert_eq!(parsed.access_token, "header.payload.signature");
+        assert_eq!(parsed.account_id.as_deref(), Some("account-123"));
     }
 
     #[cfg(target_os = "macos")]

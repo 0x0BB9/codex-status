@@ -46,11 +46,21 @@ import {
   CodexAppServerShellClient,
   isTauriRuntime,
 } from "./lib/tauri-shell";
+import {
+  readCodexResetCredits,
+  type ResetCreditsSnapshot,
+} from "./lib/reset-credits";
 import "./App.css";
 
 type ConnectionState = "disconnected" | "connecting" | "connected" | "error";
 type FloatingMode = "expanded" | "peek";
-type AppTheme = "ember" | "ocean" | "forest" | "coral" | "graphite";
+type AppTheme =
+  | "ember"
+  | "ocean"
+  | "aurora"
+  | "forest"
+  | "coral"
+  | "graphite";
 type ThreadFilter = "all" | "recent" | "idle" | "systemError";
 type ThreadGroupBy = "none" | "project" | "priority" | "stage";
 type AccountLoginFlow = {
@@ -77,6 +87,8 @@ type DashboardClient = {
 };
 
 const MAX_LOG_LINES = 6;
+const RESET_CREDITS_REFRESH_MS = 5 * 60_000;
+const RESET_CREDITS_RETRY_MS = 60_000;
 const RESTART_CODEX_CLIENT_AFTER_SWITCH_KEY =
   "codex-status-floater.restartCodexClientAfterSwitch";
 const APP_THEME_STORAGE_KEY = "codex-status-floater.theme";
@@ -94,6 +106,12 @@ const APP_THEMES: Array<{
     id: "ocean",
     label: "雾蓝",
     swatch: "linear-gradient(135deg, #397e9d 0 48%, #f9fcfd 48%)",
+  },
+  {
+    id: "aurora",
+    label: "极光",
+    swatch:
+      "linear-gradient(135deg, #397ae0 0 34%, #8ed9cd 34% 58%, #f5f9fe 58%)",
   },
   {
     id: "forest",
@@ -484,6 +502,48 @@ function formatResetTime(unixSeconds: number | null | undefined) {
     month: "short",
     day: "numeric",
   }).format(unixSeconds * 1000);
+}
+
+function formatResetTimeDetails(unixSeconds: number | null | undefined) {
+  if (!unixSeconds) {
+    return "暂无重置时间";
+  }
+
+  const relative = formatRelativeTime(unixSeconds);
+  return `${relative} · ${formatResetTime(unixSeconds)}`;
+}
+
+function parseResetCreditExpiration(value: string) {
+  if (/^\d+$/.test(value)) {
+    const numeric = Number(value);
+    return numeric < 10_000_000_000 ? numeric * 1000 : numeric;
+  }
+
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function getNearestResetCreditExpiration(values: string[]) {
+  const timestamps = values
+    .map(parseResetCreditExpiration)
+    .filter((value): value is number => value !== null)
+    .sort((left, right) => left - right);
+  const future = timestamps.find((value) => value >= Date.now());
+  return future ?? timestamps[timestamps.length - 1] ?? null;
+}
+
+function formatResetCreditExpiration(values: string[]) {
+  const timestamp = getNearestResetCreditExpiration(values);
+  if (!timestamp) {
+    return null;
+  }
+
+  return new Intl.DateTimeFormat("zh-CN", {
+    hour: "numeric",
+    minute: "2-digit",
+    month: "short",
+    day: "numeric",
+  }).format(timestamp);
 }
 
 function formatRateLimitWindowLabel(
@@ -917,6 +977,8 @@ function App() {
   const collapseTimerRef = useRef<number | null>(null);
   const dimTimerRef = useRef<number | null>(null);
   const lastExpandedWindowRef = useRef<FloatingWindowSnapshot | null>(null);
+  const resetCreditsGenerationRef = useRef(0);
+  const resetCreditsLastAttemptAtRef = useRef(0);
   const [connectionState, setConnectionState] =
     useState<ConnectionState>("disconnected");
   const [appVersion, setAppVersion] = useState<string | null>(null);
@@ -932,6 +994,8 @@ function App() {
   const serverUrl = DEFAULT_CODEX_WS_URL;
   const [account, setAccount] = useState<Account | null>(null);
   const [rateLimits, setRateLimits] = useState<RateLimitSnapshot[]>([]);
+  const [resetCredits, setResetCredits] = useState<ResetCreditsSnapshot | null>(null);
+  const [resetCreditsError, setResetCreditsError] = useState<string | null>(null);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [lastSyncAt, setLastSyncAt] = useState<number | null>(null);
   const [lastEvent, setLastEvent] = useState<string>("暂无事件");
@@ -1076,11 +1140,53 @@ function App() {
     }
   });
 
-  const refreshSnapshot = useEffectEvent(async () => {
+  const refreshResetCredits = useEffectEvent(
+    async (options: { force?: boolean } = {}) => {
+      if (!isTauri) {
+        return;
+      }
+
+      const now = Date.now();
+      const refreshDelay = resetCreditsError
+        ? RESET_CREDITS_RETRY_MS
+        : RESET_CREDITS_REFRESH_MS;
+      if (
+        !options.force &&
+        now - resetCreditsLastAttemptAtRef.current < refreshDelay
+      ) {
+        return;
+      }
+
+      resetCreditsLastAttemptAtRef.current = now;
+      const requestGeneration = resetCreditsGenerationRef.current;
+      try {
+        const snapshot = await readCodexResetCredits();
+        if (requestGeneration !== resetCreditsGenerationRef.current) {
+          return;
+        }
+        startTransition(() => {
+          setResetCredits(snapshot);
+          setResetCreditsError(null);
+        });
+      } catch {
+        if (requestGeneration !== resetCreditsGenerationRef.current) {
+          return;
+        }
+        startTransition(() => {
+          setResetCreditsError("重置次数暂不可用，稍后会自动重试。");
+        });
+      }
+    },
+  );
+
+  const refreshSnapshot = useEffectEvent(
+    async (options: { forceResetCredits?: boolean } = {}) => {
     const client = clientRef.current;
     if (!client || !client.isConnected()) {
       return;
     }
+
+    void refreshResetCredits({ force: options.forceResetCredits });
 
     const [accountResult, rateLimitResult, threadResult] = await Promise.allSettled([
       client.getAccount(),
@@ -1118,7 +1224,8 @@ function App() {
 
       setLastSyncAt(Date.now());
     });
-  });
+    },
+  );
 
   const handleRestartCodexClient = useEffectEvent(async () => {
     if (!isTauri || isRestartingCodexClient) {
@@ -1163,6 +1270,10 @@ function App() {
         return;
       }
 
+      resetCreditsGenerationRef.current += 1;
+      setResetCredits(null);
+      setResetCreditsError(null);
+      resetCreditsLastAttemptAtRef.current = 0;
       setAccountLoginMessage("登录成功，正在保存账号快照...");
       setAuthError(null);
 
@@ -1171,7 +1282,7 @@ function App() {
         setAuthRegistry(registry);
         setLastEvent("account/login/completed");
         setAccountLoginMessage("登录成功，已添加到账号列表并设为当前账号。");
-        await refreshSnapshot();
+        await refreshSnapshot({ forceResetCredits: true });
 
         if (restartCodexClientAfterSwitch) {
           const restarted = await handleRestartCodexClient();
@@ -1199,7 +1310,11 @@ function App() {
 
     switch (notification.method) {
       case "account/updated":
-        void refreshSnapshot();
+        resetCreditsGenerationRef.current += 1;
+        setResetCredits(null);
+        setResetCreditsError(null);
+        resetCreditsLastAttemptAtRef.current = 0;
+        void refreshSnapshot({ forceResetCredits: true });
         break;
       case "account/login/completed":
         void handleAccountLoginCompleted(notification.params);
@@ -1647,6 +1762,10 @@ function App() {
     setAccountLoginMessage("正在切换并验证账号...");
     setLastError(null);
     setRateLimitError(null);
+    resetCreditsGenerationRef.current += 1;
+    setResetCredits(null);
+    setResetCreditsError(null);
+    resetCreditsLastAttemptAtRef.current = 0;
 
     try {
       await ensureFileAuthCredentialsStore();
@@ -1706,6 +1825,10 @@ function App() {
           await disconnectClient("Reconnecting");
           const rollbackResult = await switchLocalCodexAccount(previousAccountKey);
           setAuthRegistry(rollbackResult.registry);
+          resetCreditsGenerationRef.current += 1;
+          setResetCredits(null);
+          setResetCreditsError(null);
+          resetCreditsLastAttemptAtRef.current = 0;
           await connectToServer({ launchIfNeeded: true });
 
           const rollbackClient = clientRef.current;
@@ -1952,6 +2075,9 @@ function App() {
   const isBusy = connectionState === "connecting" || isLaunching;
   const displayedError = formatConnectionError(lastError);
   const displayedRateLimitError = formatRateLimitError(rateLimitError);
+  const resetCreditExpiration = formatResetCreditExpiration(
+    resetCredits?.expiresAt ?? [],
+  );
   const authAccounts = authRegistry?.accounts ?? [];
   const activeAuthKey = authRegistry?.active_account_key ?? null;
   const globalPrimaryUsage = getGlobalPrimaryUsage(rateLimits);
@@ -2124,7 +2250,7 @@ function App() {
           {globalPrimaryUsage.poolLabel ? ` · ${globalPrimaryUsage.poolLabel}` : " · 等待额度数据"}
           {" · "}
           {globalPrimaryUsage.resetsAt
-            ? `重置 ${formatResetTime(globalPrimaryUsage.resetsAt)}`
+            ? `重置 ${formatResetTimeDetails(globalPrimaryUsage.resetsAt)}`
             : "重置时间暂无"}
         </p>
       </aside>
@@ -2141,7 +2267,7 @@ function App() {
           </button>
           <button
             type="button"
-            onClick={() => void refreshSnapshot()}
+            onClick={() => void refreshSnapshot({ forceResetCredits: true })}
             disabled={!isConnected}
           >
             刷新
@@ -2362,6 +2488,30 @@ function App() {
           <p className="warning-text">{displayedRateLimitError}</p>
         ) : null}
 
+        <div className="reset-credit-summary">
+          <div>
+            <span>可用重置次数</span>
+            <strong>
+              {resetCredits?.availableCount === null || !resetCredits
+                ? "暂无"
+                : `${resetCredits.availableCount} 次`}
+            </strong>
+          </div>
+          <p>
+            {resetCreditsError
+              ? resetCreditsError
+              : !resetCredits
+                ? "正在读取当前账号的重置次数..."
+                : resetCredits.availableCount === null
+                ? "当前账号的额度服务未提供重置次数。"
+                : resetCredits.availableCount === 0
+                  ? "当前没有可用的额度重置机会。"
+                  : resetCreditExpiration
+                    ? `最近到期 ${resetCreditExpiration}`
+                    : "额度服务未提供到期时间。"}
+          </p>
+        </div>
+
         {rateLimits.length === 0 ? (
           <p className="empty-state">
             {displayedRateLimitError
@@ -2412,7 +2562,7 @@ function App() {
                     />
                   </div>
                   <span className="meter-note">
-                    重置时间 {formatResetTime(snapshot.primary?.resetsAt)}
+                    重置时间 {formatResetTimeDetails(snapshot.primary?.resetsAt)}
                   </span>
                 </div>
 
@@ -2432,7 +2582,7 @@ function App() {
                     />
                   </div>
                   <span className="meter-note">
-                    重置时间 {formatResetTime(snapshot.secondary?.resetsAt)}
+                    重置时间 {formatResetTimeDetails(snapshot.secondary?.resetsAt)}
                   </span>
                 </div>
 

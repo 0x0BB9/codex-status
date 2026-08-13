@@ -112,6 +112,7 @@ Windows 未签名安装包可能触发 Microsoft Defender SmartScreen。公开�
 ## 隐私边界
 
 - 应用只在用户本机读取 Codex app-server、本机 `.codex/auth.json` 和本机任务元数据。
+- 可用重置次数只读请求 `https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`；现有 access token 仅作为该 HTTPS 请求的敏感请求头，不写入日志或本工具的状态文件。
 - 账号快照保存在用户自己的 `.codex/accounts/`。
 - 本项目不内置任何服务端，也不会上传 token。
 - 安装包会包含 Apache-2.0 许可的官方 Codex 原生二进制和第三方声明，不包含开发者账号数据。

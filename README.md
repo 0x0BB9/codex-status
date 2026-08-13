@@ -14,7 +14,7 @@ Packaged builds include the official Codex native binary as a local sidecar, so 
 
 - account mode and plan summary
 - saved local Codex accounts with one-click switching
-- short-window and long-window usage for each rate-limit bucket
+- short-window and long-window usage, reset times, and available reset-credit expirations
 - recent threads sorted by latest activity
 - local task board metadata: pinned threads, notes, project, priority, and stage
 - live status notifications such as `thread/status/changed`
@@ -83,6 +83,10 @@ The Tauri shell is configured to:
 - appear as a narrow side utility window
 - launch the bundled official `codex app-server` sidecar over stdio, with installed desktop apps and PATH as compatibility fallbacks
 - manage local Codex account snapshots through Tauri commands
+
+## Reset Credit Data
+
+Account, task, and normal rate-limit data continue to come from the official `codex app-server`. Because the current app-server protocol does not expose available reset-credit counts, the app reads the active `auth.json` session only for this supplemental value and makes a read-only request to the ChatGPT reset-credit endpoint. Tokens, account IDs, and raw responses are never persisted or logged. If this endpoint is unavailable or changes shape, only the reset-credit summary is hidden; the rest of the dashboard keeps working.
 
 ## Build Notes
 
