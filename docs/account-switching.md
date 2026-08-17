@@ -59,8 +59,8 @@
 1. 工具把当前 `~/.codex/auth.json` 回写到当前账号快照，保存 Codex 自动刷新后的最新 token。
 2. 工具把当前认证备份到 `accounts/auth.json.bak.<timestamp>`。
 3. 工具用目标账号快照替换 `~/.codex/auth.json`，并更新 `registry.json`。
-4. 浮窗重启自己的 `codex app-server`，强制刷新并验证目标账号认证。
-5. 验证成功后，再把刷新后的认证回写到目标账号快照。
+4. 浮窗重启自己的 `codex app-server`，读取并验证目标账号登录状态，但不会仅为切换而强制轮换 refresh token。
+5. 验证成功后，再把 Codex 当前使用的认证回写到目标账号快照；Codex 在真正需要时仍会自动刷新 token。
 6. 如果验证失败，工具会自动切回并验证原账号，避免停留在未登录状态。
 
 如果打开了“账号变更后自动重启 Codex 客户端”，工具会在目标账号验证成功后重启官方 Codex 桌面客户端。也可以在账号面板里点击“立即重启 Codex 客户端”手动触发。
@@ -84,6 +84,7 @@ macOS 会通过 bundle id `com.openai.codex` 请求官方客户端退出，等�
 ## 限制
 
 - 这个工具调用 Codex app-server 的官方登录流程，不直接实现 OAuth token exchange。
+- refresh token 可能被其他 Codex 客户端、CLI 或扩展轮换或撤销；已经永久失效的账号仍需要重新登录一次。
 - 发布安装包内置官方 Codex app-server，因此接收方不需要安装 Codex CLI。
 - 工具只管理本机文件，不跨设备同步账号。
 - 认证文件包含敏感 token，不要把 `~/.codex/accounts` 提交到 Git 或发给别人。

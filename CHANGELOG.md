@@ -6,6 +6,13 @@
 
 暂无。
 
+## [0.1.12] - 2026-08-17
+
+### 修复
+
+- 修复账号切换和失败回滚时无条件强制刷新 OAuth token，导致较久未使用的账号可能因 refresh token 已轮换而无法切换的问题。
+- 细化 refresh token 已使用、过期、撤销或账号不匹配时的中文错误提示。
+
 ## [0.1.11] - 2026-08-13
 
 ### 新增
@@ -107,6 +114,7 @@
 - 账号凭据只保存在用户本机的 `~/.codex` 目录，不写入仓库或安装包。
 - 切换账号前备份当前鉴权文件，验证失败时自动恢复原账号。
 
+[0.1.12]: https://github.com/0x0BB9/codex-status/releases/tag/v0.1.12
 [0.1.11]: https://github.com/0x0BB9/codex-status/releases/tag/v0.1.11
 [0.1.10]: https://github.com/0x0BB9/codex-status/releases/tag/v0.1.10
 [0.1.9]: https://github.com/0x0BB9/codex-status/releases/tag/v0.1.9

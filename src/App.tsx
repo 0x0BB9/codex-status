@@ -811,6 +811,31 @@ function getErrorMessage(error: unknown, fallback: string) {
 
 function formatLocalAccountError(error: unknown, fallback: string) {
   const message = getErrorMessage(error, fallback);
+  const normalizedMessage = message.toLowerCase();
+
+  if (
+    normalizedMessage.includes("refresh token was already used") ||
+    normalizedMessage.includes("refresh_token_reused")
+  ) {
+    return "该账号的刷新凭据已被其他 Codex 进程使用，请重新登录并添加该账号。";
+  }
+
+  if (
+    normalizedMessage.includes("refresh token has expired") ||
+    normalizedMessage.includes("refresh token was revoked") ||
+    normalizedMessage.includes("refresh_token_expired") ||
+    normalizedMessage.includes("refresh_token_invalidated")
+  ) {
+    return "该账号的刷新凭据已过期或被撤销，请重新登录并添加该账号。";
+  }
+
+  if (
+    normalizedMessage.includes("signed out or signed in to another account") ||
+    normalizedMessage.includes("since logged out or signed in to another account") ||
+    normalizedMessage.includes("refresh_token_account_mismatch")
+  ) {
+    return "该账号在其他 Codex 会话中退出或切换过账号，请重新登录并添加该账号。";
+  }
 
   if (message.includes("Current ~/.codex/auth.json")) {
     return "当前 ~/.codex/auth.json 里没有可保存的 ChatGPT 登录状态或 API Key。";
@@ -1941,9 +1966,10 @@ function App() {
         throw new Error("切换后无法连接 Codex app-server，目标账号尚未验证。");
       }
 
-      const accountResult = await client.getAccount(true);
+      // Do not rotate a saved refresh token just to verify a local account switch.
+      const accountResult = await client.getAccount();
       if (!accountResult.account) {
-        throw new Error("目标账号认证已失效，请重新登录并添加该账号。");
+        throw new Error("Codex 未能读取目标账号登录状态，请重新登录并添加该账号。");
       }
 
       const verifiedRegistry = await saveCurrentCodexAccount();
@@ -1996,9 +2022,9 @@ function App() {
             throw new Error("恢复后无法连接 Codex app-server。");
           }
 
-          const rollbackAccount = await rollbackClient.getAccount(true);
+          const rollbackAccount = await rollbackClient.getAccount();
           if (!rollbackAccount.account) {
-            throw new Error("原账号认证也已失效。");
+            throw new Error("Codex 也未能读取原账号登录状态。");
           }
 
           const restoredRegistry = await saveCurrentCodexAccount();

@@ -32,7 +32,7 @@ The app implements local account switching itself. It does not require `codex-au
 - The app automatically enables file-backed Codex credentials before adding, saving, or switching an account and backs up an existing config before changing it.
 - Clicking "登录添加账号" starts the official Codex app-server login flow, then saves the completed auth as a local snapshot.
 - Clicking "保存当前账号" stores the currently logged-in Codex auth as a local snapshot.
-- Clicking "切换" first saves the active account's latest tokens, replaces `auth.json`, then forces Codex to refresh and verify the target account.
+- Clicking "切换" first saves the active account's latest tokens, replaces `auth.json`, then restarts app-server and verifies the existing login without forcing refresh-token rotation.
 - Failed verification automatically restores the previous account instead of leaving Codex signed out.
 - The account panel can restart the official Codex desktop client on macOS or Windows after a verified switch. Newer ChatGPT desktop builds may keep a separate host session that still needs confirmation inside the official client.
 
