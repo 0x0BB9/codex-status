@@ -74,7 +74,7 @@ GitHub 仓库的 `Build Windows` 工作流支持手动触发，也会在推送 `
 
 ## 应用更新与签名密钥
 
-Windows 使用 Tauri updater 在应用内下载和安装更新；macOS 使用同一份 `latest.json` 检查版本，但会跳转 GitHub Release 手动下载。
+Windows 与 macOS 都使用 Tauri updater 在应用内下载和安装更新。macOS 更新包使用 `.app.tar.gz`，Windows 更新包使用 NSIS EXE；两者都从同一份 `latest.json` 读取版本、下载地址和签名。macOS 用户必须先把 App 复制到 `/Applications`，不能直接从只读 DMG 中运行并更新。
 
 - 本机长期私钥默认保存在 `~/.tauri/codex-status-floater.key`，权限应保持为 `600`。
 - 公钥已经写入 `src-tauri/tauri.conf.json`，可以公开提交。

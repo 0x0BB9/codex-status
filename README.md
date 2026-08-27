@@ -20,7 +20,7 @@ Packaged builds include the official Codex native binary as a local sidecar, so 
 - live status notifications such as `thread/status/changed`
 - tray menu controls, a global window toggle, transparent floating, and edge snapping
 - right-edge auto-collapse into a small usage capsule with click-to-expand
-- in-app update checks with Windows install/relaunch and macOS Release links
+- signed in-app update checks, installation, and relaunch on Windows and macOS
 - a tiny local server log when the app launches `codex app-server` itself
 
 ## Account Switching
@@ -58,9 +58,9 @@ Release notes and version history are available in [CHANGELOG.md](CHANGELOG.md).
 
 Click the version badge in the header to check for updates. The app also performs one silent check after startup.
 
-- Windows downloads and installs signed updater artifacts in-app, then relaunches.
-- macOS opens the matching GitHub Release when a newer version is available.
-- v0.1.10 and older builds do not contain the updater client, so they must be upgraded to v0.1.11 manually once.
+- Windows and macOS download and install signed updater artifacts in-app, then relaunch.
+- On macOS, copy the app to `/Applications` before using in-app updates; do not run it directly from the DMG.
+- macOS must be upgraded manually once to the first release that supports automatic installation; later releases can update in-app.
 
 ## Local Web Preview
 

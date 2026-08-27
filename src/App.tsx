@@ -199,6 +199,7 @@ const IS_WINDOWS =
   typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
 const IS_MACOS =
   typeof navigator !== "undefined" && navigator.userAgent.includes("Macintosh");
+const CAN_INSTALL_APP_UPDATE = IS_WINDOWS || IS_MACOS;
 const RELEASE_URL = "https://github.com/0x0BB9/codex-status/releases";
 const INITIAL_APP_UPDATE_STATE: AppUpdateState = {
   error: null,
@@ -1688,7 +1689,7 @@ function App() {
           return;
         }
 
-        if (IS_WINDOWS) {
+        if (CAN_INSTALL_APP_UPDATE) {
           appUpdateRef.current = update;
         } else {
           await update.close();
@@ -1721,7 +1722,7 @@ function App() {
       return;
     }
 
-    if (IS_MACOS) {
+    if (!CAN_INSTALL_APP_UPDATE) {
       try {
         await openUrl(getReleaseUrl(appUpdate.version));
       } catch (error) {
@@ -1735,7 +1736,7 @@ function App() {
     }
 
     const update = appUpdateRef.current;
-    if (!IS_WINDOWS || !update) {
+    if (!update) {
       await checkForAppUpdate();
       return;
     }
@@ -1775,7 +1776,12 @@ function App() {
     } catch (error) {
       setAppUpdate((current) => ({
         ...current,
-        error: getErrorMessage(error, "新版安装失败，请重试。"),
+        error: getErrorMessage(
+          error,
+          IS_MACOS
+            ? "新版安装失败，请确认应用位于 /Applications 且当前用户可以写入。"
+            : "新版安装失败，请重试。",
+        ),
         phase: "error",
       }));
     }
@@ -2369,7 +2375,9 @@ function App() {
                 }
                 title={
                   appUpdate.phase === "available"
-                    ? `发现 v${appUpdate.version}，点击${IS_WINDOWS ? "更新" : "下载"}`
+                    ? `发现 v${appUpdate.version}，点击${
+                        CAN_INSTALL_APP_UPDATE ? "更新" : "下载"
+                      }`
                     : appUpdate.error ?? "点击检查更新"
                 }
                 type="button"
@@ -2493,9 +2501,9 @@ function App() {
               {appUpdate.error
                 ? appUpdate.error
                 : appUpdate.phase === "available"
-                  ? IS_WINDOWS
+                  ? CAN_INSTALL_APP_UPDATE
                     ? "可以直接在应用内下载、安装并自动重启。"
-                    : "macOS 将打开 GitHub Release 下载页面。"
+                    : "将打开 GitHub Release 下载页面。"
                   : appUpdate.phase === "downloading"
                     ? appUpdate.progress === null
                       ? "正在获取安装包，请保持网络连接。"
@@ -2507,7 +2515,7 @@ function App() {
             <button className="primary" type="button" onClick={() => void handleAppUpdate()}>
               {appUpdate.phase === "error"
                 ? "重试"
-                : IS_WINDOWS
+                : CAN_INSTALL_APP_UPDATE
                   ? "立即更新"
                   : "前往下载"}
             </button>

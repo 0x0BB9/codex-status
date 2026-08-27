@@ -6,6 +6,12 @@
 
 暂无。
 
+## [0.1.13] - 2026-08-27
+
+### 新增
+
+- macOS 支持在应用内下载、校验、安装新版并自动重启，不再只跳转 GitHub Release。
+
 ## [0.1.12] - 2026-08-17
 
 ### 修复
@@ -114,6 +120,7 @@
 - 账号凭据只保存在用户本机的 `~/.codex` 目录，不写入仓库或安装包。
 - 切换账号前备份当前鉴权文件，验证失败时自动恢复原账号。
 
+[0.1.13]: https://github.com/0x0BB9/codex-status/releases/tag/v0.1.13
 [0.1.12]: https://github.com/0x0BB9/codex-status/releases/tag/v0.1.12
 [0.1.11]: https://github.com/0x0BB9/codex-status/releases/tag/v0.1.11
 [0.1.10]: https://github.com/0x0BB9/codex-status/releases/tag/v0.1.10
