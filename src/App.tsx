@@ -28,8 +28,11 @@ import type {
 } from "./generated/v2";
 import { CodexAppServerClient, DEFAULT_CODEX_WS_URL } from "./lib/codex-app-server";
 import {
+  clearLocalCodexAccountInvalid,
+  deleteLocalCodexAccount,
   ensureFileAuthCredentialsStore,
   listLocalCodexAccounts,
+  markLocalCodexAccountInvalid,
   restartCodexDesktopClient,
   saveCurrentCodexAccount,
   switchLocalCodexAccount,
@@ -79,10 +82,20 @@ type AppUpdateState = {
   progress: number | null;
   version: string | null;
 };
+type CompletedUpdateNotice = {
+  fromVersion: string | null;
+  notes: string;
+  toVersion: string;
+};
+type PendingAppUpdate = CompletedUpdateNotice & {
+  startedAt: number;
+};
 type AccountLoginFlow = {
   authUrl?: string;
   loginId: string;
   startedAt: number;
+  targetAccountKey?: string;
+  targetAccountTitle?: string;
   type: "chatgpt" | "chatgptDeviceCode";
   userCode?: string;
   verificationUrl?: string;
@@ -108,6 +121,14 @@ const RESET_CREDITS_RETRY_MS = 60_000;
 const RESTART_CODEX_CLIENT_AFTER_SWITCH_KEY =
   "codex-status-floater.restartCodexClientAfterSwitch";
 const APP_THEME_STORAGE_KEY = "codex-status-floater.theme";
+const LAST_RUN_APP_VERSION_KEY = "codex-status-floater.lastRunAppVersion";
+const PENDING_APP_UPDATE_KEY = "codex-status-floater.pendingAppUpdate";
+const CURRENT_RELEASE_VERSION = "0.1.14";
+const CURRENT_RELEASE_NOTES = [
+  "更新完成后显示一次升级结果和本次更新内容。",
+  "账号切换验证失败后会标记为需要重新登录。",
+  "支持重新登录失效账号，并安全删除非当前账号。",
+].join("\n");
 const APP_THEMES: Array<{
   id: AppTheme;
   label: string;
@@ -214,6 +235,87 @@ function isAppTheme(value: string | null): value is AppTheme {
 
 function getReleaseUrl(version: string) {
   return `${RELEASE_URL}/tag/v${version.replace(/^v/, "")}`;
+}
+
+function compactUpdateNotes(notes: string) {
+  const lines = notes
+    .split("\n")
+    .map((line) => line.trim().replace(/^#+\s*/, "").replace(/^-\s*/, ""))
+    .filter(
+      (line) =>
+        line && !["更新内容", "更新说明", "安全说明"].includes(line),
+    )
+    .slice(0, 4);
+
+  return lines.length > 0 ? lines.join("\n") : "新版已经安装完成。";
+}
+
+function readPendingAppUpdate(): PendingAppUpdate | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  const rawValue = window.localStorage.getItem(PENDING_APP_UPDATE_KEY);
+  if (!rawValue) {
+    return null;
+  }
+
+  try {
+    const value = JSON.parse(rawValue) as Partial<PendingAppUpdate>;
+    if (
+      typeof value.toVersion !== "string" ||
+      typeof value.notes !== "string" ||
+      typeof value.startedAt !== "number"
+    ) {
+      return null;
+    }
+
+    return {
+      fromVersion: typeof value.fromVersion === "string" ? value.fromVersion : null,
+      notes: value.notes,
+      startedAt: value.startedAt,
+      toVersion: value.toVersion,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function getCompletedUpdateNotice(
+  currentVersion: string,
+  hadExistingAppState: boolean,
+): CompletedUpdateNotice | null {
+  const pendingUpdate = readPendingAppUpdate();
+  if (pendingUpdate?.toVersion === currentVersion) {
+    window.localStorage.removeItem(PENDING_APP_UPDATE_KEY);
+    return pendingUpdate;
+  }
+
+  const previousVersion = window.localStorage.getItem(LAST_RUN_APP_VERSION_KEY);
+  if (previousVersion && previousVersion !== currentVersion) {
+    return {
+      fromVersion: previousVersion,
+      notes:
+        currentVersion === CURRENT_RELEASE_VERSION
+          ? CURRENT_RELEASE_NOTES
+          : "新版已经安装完成，可在更新日志中查看详细变化。",
+      toVersion: currentVersion,
+    };
+  }
+
+  if (
+    !previousVersion &&
+    hadExistingAppState &&
+    currentVersion === CURRENT_RELEASE_VERSION
+  ) {
+    return {
+      fromVersion: null,
+      notes: CURRENT_RELEASE_NOTES,
+      toVersion: currentVersion,
+    };
+  }
+
+  return null;
 }
 
 type AppWindow = ReturnType<typeof getCurrentWindow>;
@@ -747,6 +849,8 @@ function formatEventName(method: string) {
       return "账号登录已完成";
     case "account/login/started":
       return "账号登录已开始";
+    case "account/deleted":
+      return "本地账号已删除";
     case "codex-client/restarted":
       return "Codex 客户端已重启";
     case "thread/status/changed":
@@ -848,6 +952,10 @@ function formatLocalAccountError(error: unknown, fallback: string) {
 
   if (message.includes("Account is not saved in the local registry")) {
     return "账号列表中找不到这个账号，请刷新账号列表后重试。";
+  }
+
+  if (message.includes("The active account cannot be deleted")) {
+    return "当前正在使用的账号不能删除，请先切换到其他账号。";
   }
 
   if (message.includes("Unable to read") || message.includes("Unable to parse")) {
@@ -1031,6 +1139,11 @@ function App() {
   const clientRef = useRef<DashboardClient | null>(null);
   const appUpdateRef = useRef<Update | null>(null);
   const isCheckingForUpdateRef = useRef(false);
+  const hadExistingAppStateRef = useRef(
+    typeof window !== "undefined" &&
+      (window.localStorage.getItem(APP_THEME_STORAGE_KEY) !== null ||
+        window.localStorage.getItem(RESTART_CODEX_CLIENT_AFTER_SWITCH_KEY) !== null),
+  );
   const collapseTimerRef = useRef<number | null>(null);
   const dimTimerRef = useRef<number | null>(null);
   const lastExpandedWindowRef = useRef<FloatingWindowSnapshot | null>(null);
@@ -1042,6 +1155,8 @@ function App() {
   const [appUpdate, setAppUpdate] = useState<AppUpdateState>(
     INITIAL_APP_UPDATE_STATE,
   );
+  const [completedUpdateNotice, setCompletedUpdateNotice] =
+    useState<CompletedUpdateNotice | null>(null);
   const [appTheme, setAppTheme] = useState<AppTheme>(() => {
     if (typeof window === "undefined") {
       return "ember";
@@ -1098,6 +1213,10 @@ function App() {
       return storedValue === null ? true : storedValue === "true";
     });
   const [switchingAccountKey, setSwitchingAccountKey] = useState<string | null>(null);
+  const [deletingAccountKey, setDeletingAccountKey] = useState<string | null>(null);
+  const [confirmingDeleteAccountKey, setConfirmingDeleteAccountKey] = useState<
+    string | null
+  >(null);
   const isTauri = isTauriRuntime();
   const deferredQuery = useDeferredValue(query);
 
@@ -1315,6 +1434,9 @@ function App() {
         return;
       }
 
+      const targetAccountKey = accountLoginFlow?.targetAccountKey;
+      const targetAccountTitle = accountLoginFlow?.targetAccountTitle;
+
       setIsStartingAccountLogin(false);
       setAccountLoginFlow((current) => {
         if (!current || !params.loginId || current.loginId === params.loginId) {
@@ -1338,11 +1460,29 @@ function App() {
       setAuthError(null);
 
       try {
-        const registry = await saveCurrentCodexAccount();
+        let registry = await saveCurrentCodexAccount();
+        if (registry.active_account_key) {
+          registry = await clearLocalCodexAccountInvalid(
+            registry.active_account_key,
+          );
+        }
         setAuthRegistry(registry);
         setLastEvent("account/login/completed");
-        setAccountLoginMessage("登录成功，已添加到账号列表并设为当前账号。");
         await refreshSnapshot({ forceResetCredits: true });
+
+        if (targetAccountKey && registry.active_account_key !== targetAccountKey) {
+          setAuthError(
+            `登录完成，但不是“${targetAccountTitle ?? "目标账号"}”。新登录账号已保存，原账号仍标记为需要重新登录。`,
+          );
+          setAccountLoginMessage("请在原账号卡片上再次点击“重新登录”。");
+          return;
+        }
+
+        setAccountLoginMessage(
+          targetAccountKey
+            ? `“${targetAccountTitle ?? "目标账号"}”已重新登录，失效标记已清除。`
+            : "登录成功，已添加到账号列表并设为当前账号。",
+        );
 
         if (restartCodexClientAfterSwitch) {
           const restarted = await handleRestartCodexClient();
@@ -1751,6 +1891,16 @@ function App() {
     }));
 
     try {
+      const pendingUpdate: PendingAppUpdate = {
+        fromVersion: update.currentVersion || appVersion,
+        notes: compactUpdateNotes(update.body?.trim() || "新版已经安装完成。"),
+        startedAt: Date.now(),
+        toVersion: update.version,
+      };
+      window.localStorage.setItem(
+        PENDING_APP_UPDATE_KEY,
+        JSON.stringify(pendingUpdate),
+      );
       await update.downloadAndInstall((event) => {
         if (event.event === "Started") {
           total = event.data.contentLength ?? null;
@@ -1774,6 +1924,7 @@ function App() {
       });
       await relaunch();
     } catch (error) {
+      window.localStorage.removeItem(PENDING_APP_UPDATE_KEY);
       setAppUpdate((current) => ({
         ...current,
         error: getErrorMessage(
@@ -1782,6 +1933,18 @@ function App() {
             ? "新版安装失败，请确认应用位于 /Applications 且当前用户可以写入。"
             : "新版安装失败，请重试。",
         ),
+        phase: "error",
+      }));
+    }
+  });
+
+  const handleOpenReleaseNotes = useEffectEvent(async (version: string) => {
+    try {
+      await openUrl(getReleaseUrl(version));
+    } catch (error) {
+      setAppUpdate((current) => ({
+        ...current,
+        error: getErrorMessage(error, "无法打开更新日志页面。"),
         phase: "error",
       }));
     }
@@ -1817,16 +1980,30 @@ function App() {
     }
   });
 
-  const handleStartAccountLogin = useEffectEvent(async () => {
+  const handleStartAccountLogin = useEffectEvent(async (targetAccountKey?: string) => {
     if (
       !isTauri ||
       isStartingAccountLogin ||
       accountLoginFlow ||
+      deletingAccountKey ||
       connectionState === "connecting" ||
       isLaunching
     ) {
       return;
     }
+
+    const targetAccount = targetAccountKey
+      ? authRegistry?.accounts.find(
+          (savedAccount) => savedAccount.account_key === targetAccountKey,
+        )
+      : undefined;
+    if (targetAccountKey && !targetAccount) {
+      setAuthError("账号列表中找不到需要重新登录的账号，请刷新账号列表后重试。");
+      return;
+    }
+    const targetAccountTitle = targetAccount
+      ? getAuthAccountTitle(targetAccount)
+      : undefined;
 
     setIsStartingAccountLogin(true);
     setAuthError(null);
@@ -1889,11 +2066,17 @@ function App() {
         setAccountLoginFlow({
           type: "chatgptDeviceCode",
           loginId: response.loginId,
+          targetAccountKey,
+          targetAccountTitle,
           verificationUrl: response.verificationUrl,
           userCode: response.userCode,
           startedAt: Date.now(),
         });
-        setAccountLoginMessage("请在浏览器完成登录，完成后会自动保存到账号列表。");
+        setAccountLoginMessage(
+          targetAccount
+            ? `请登录“${targetAccountTitle}”对应的 ChatGPT 账号。`
+            : "请在浏览器完成登录，完成后会自动保存到账号列表。",
+        );
         setLastEvent("account/login/started");
         void handleOpenAccountLoginUrl(response.verificationUrl);
         return;
@@ -1903,11 +2086,15 @@ function App() {
         setAccountLoginFlow({
           type: "chatgpt",
           loginId: response.loginId,
+          targetAccountKey,
+          targetAccountTitle,
           authUrl: response.authUrl,
           startedAt: Date.now(),
         });
         setAccountLoginMessage(
-          "请在浏览器选择要添加的 ChatGPT 账号；完成后会自动保存到账号列表。",
+          targetAccount
+            ? `请在浏览器选择“${targetAccountTitle}”对应的 ChatGPT 账号。`
+            : "请在浏览器选择要添加的 ChatGPT 账号；完成后会自动保存到账号列表。",
         );
         setLastEvent("account/login/started");
         void handleOpenAccountLoginUrl(response.authUrl);
@@ -1978,10 +2165,11 @@ function App() {
         throw new Error("Codex 未能读取目标账号登录状态，请重新登录并添加该账号。");
       }
 
-      const verifiedRegistry = await saveCurrentCodexAccount();
+      let verifiedRegistry = await saveCurrentCodexAccount();
       if (verifiedRegistry.active_account_key !== accountKey) {
         throw new Error("切换后的账号与目标账号不一致，已停止继续切换。");
       }
+      verifiedRegistry = await clearLocalCodexAccountInvalid(accountKey);
 
       setAuthRegistry(verifiedRegistry);
       setAccount(accountResult.account);
@@ -2005,6 +2193,9 @@ function App() {
       const switchError = formatLocalAccountError(error, "切换账号失败。");
       let rollbackError: string | null = null;
       let rollbackSucceeded = false;
+      const shouldMarkInvalid =
+        accountWasReplaced ||
+        /auth snapshot is missing|认证快照不存在/i.test(switchError);
 
       if (
         accountWasReplaced &&
@@ -2033,10 +2224,11 @@ function App() {
             throw new Error("Codex 也未能读取原账号登录状态。");
           }
 
-          const restoredRegistry = await saveCurrentCodexAccount();
+          let restoredRegistry = await saveCurrentCodexAccount();
           if (restoredRegistry.active_account_key !== previousAccountKey) {
             throw new Error("恢复后的账号与原账号不一致。");
           }
+          restoredRegistry = await clearLocalCodexAccountInvalid(previousAccountKey);
 
           setAuthRegistry(restoredRegistry);
           setAccount(rollbackAccount.account);
@@ -2048,6 +2240,20 @@ function App() {
           rollbackError = formatLocalAccountError(
             rollbackFailure,
             "自动恢复原账号失败。",
+          );
+        }
+      }
+
+      if (shouldMarkInvalid) {
+        try {
+          const invalidRegistry = await markLocalCodexAccountInvalid(
+            accountKey,
+            switchError,
+          );
+          setAuthRegistry(invalidRegistry);
+        } catch (markError) {
+          appendServerLog(
+            `Unable to mark account invalid: ${getErrorMessage(markError, "unknown error")}`,
           );
         }
       }
@@ -2090,6 +2296,40 @@ function App() {
     }
   });
 
+  const handleDeleteAccount = useEffectEvent(async (accountKey: string) => {
+    if (
+      !isTauri ||
+      deletingAccountKey ||
+      switchingAccountKey ||
+      accountLoginFlow ||
+      isRestartingCodexClient
+    ) {
+      return;
+    }
+
+    if (authRegistry?.active_account_key === accountKey) {
+      setAuthError("当前正在使用的账号不能删除，请先切换到其他账号。");
+      setConfirmingDeleteAccountKey(null);
+      return;
+    }
+
+    setDeletingAccountKey(accountKey);
+    setAuthError(null);
+    setAccountLoginMessage(null);
+
+    try {
+      const registry = await deleteLocalCodexAccount(accountKey);
+      setAuthRegistry(registry);
+      setAccountLoginMessage("账号及其本地认证快照已删除。");
+      setLastEvent("account/deleted");
+    } catch (error) {
+      setAuthError(formatLocalAccountError(error, "删除账号失败。"));
+    } finally {
+      setDeletingAccountKey(null);
+      setConfirmingDeleteAccountKey(null);
+    }
+  });
+
   useEffect(() => {
     if (typeof window === "undefined") {
       return;
@@ -2127,7 +2367,13 @@ function App() {
     void getVersion()
       .then((version) => {
         if (!disposed) {
+          const updateNotice = getCompletedUpdateNotice(
+            version,
+            hadExistingAppStateRef.current,
+          );
           setAppVersion(version);
+          setCompletedUpdateNotice(updateNotice);
+          window.localStorage.setItem(LAST_RUN_APP_VERSION_KEY, version);
         }
       })
       .catch(() => {
@@ -2482,6 +2728,42 @@ function App() {
         </section>
       ) : null}
 
+      {completedUpdateNotice ? (
+        <section className="update-complete-banner" aria-live="polite">
+          <div className="update-complete-mark" aria-hidden="true">
+            ✓
+          </div>
+          <div className="update-complete-content">
+            <span>更新完成</span>
+            <strong>
+              {completedUpdateNotice.fromVersion
+                ? `v${completedUpdateNotice.fromVersion} → v${completedUpdateNotice.toVersion}`
+                : `已升级到 v${completedUpdateNotice.toVersion}`}
+            </strong>
+            <p>{completedUpdateNotice.notes}</p>
+          </div>
+          <div className="update-complete-actions">
+            <button
+              type="button"
+              onClick={() =>
+                void handleOpenReleaseNotes(completedUpdateNotice.toVersion)
+              }
+            >
+              完整日志
+            </button>
+            <button
+              className="icon-button"
+              aria-label="关闭更新完成提示"
+              title="关闭"
+              type="button"
+              onClick={() => setCompletedUpdateNotice(null)}
+            >
+              ×
+            </button>
+          </div>
+        </section>
+      ) : null}
+
       {appUpdate.phase === "available" ||
       appUpdate.phase === "downloading" ||
       appUpdate.phase === "installing" ||
@@ -2594,6 +2876,7 @@ function App() {
                 isStartingAccountLogin ||
                 Boolean(accountLoginFlow) ||
                 Boolean(switchingAccountKey) ||
+                Boolean(deletingAccountKey) ||
                 isRestartingCodexClient
               }
             >
@@ -2608,6 +2891,7 @@ function App() {
                 isStartingAccountLogin ||
                 Boolean(accountLoginFlow) ||
                 Boolean(switchingAccountKey) ||
+                Boolean(deletingAccountKey) ||
                 isRestartingCodexClient ||
                 connectionState === "connecting" ||
                 isLaunching
@@ -2622,6 +2906,7 @@ function App() {
                 isSavingAccount ||
                 isStartingAccountLogin ||
                 Boolean(switchingAccountKey) ||
+                Boolean(deletingAccountKey) ||
                 isRestartingCodexClient
               }
             >
@@ -2632,8 +2917,16 @@ function App() {
           {accountLoginFlow ? (
             <div className="account-login-box">
               <div>
-                <strong>等待浏览器登录</strong>
-                <small>登录完成后会自动保存为本地账号快照，并设为当前账号。</small>
+                <strong>
+                  {accountLoginFlow.targetAccountKey
+                    ? `重新登录 ${accountLoginFlow.targetAccountTitle ?? "目标账号"}`
+                    : "等待浏览器登录"}
+                </strong>
+                <small>
+                  {accountLoginFlow.targetAccountKey
+                    ? "请确认网页中选择的是同一账号；验证成功后会清除失效标记。"
+                    : "登录完成后会自动保存为本地账号快照，并设为当前账号。"}
+                </small>
               </div>
               {accountLoginFlow.userCode ? (
                 <div className="login-code-row">
@@ -2709,11 +3002,18 @@ function App() {
               {authAccounts.map((authAccount) => {
                 const isActiveAccount = authAccount.account_key === activeAuthKey;
                 const isSwitching = switchingAccountKey === authAccount.account_key;
+                const isDeleting = deletingAccountKey === authAccount.account_key;
+                const isConfirmingDelete =
+                  confirmingDeleteAccountKey === authAccount.account_key;
+                const isInvalid = Boolean(authAccount.invalid_at);
                 const accountTitle = getAuthAccountTitle(authAccount);
                 const accountEmail = getAuthAccountEmail(authAccount);
 
                 return (
-                  <article className="account-card" key={authAccount.account_key}>
+                  <article
+                    className={`account-card${isInvalid ? " account-card-invalid" : ""}`}
+                    key={authAccount.account_key}
+                  >
                     <div>
                       <h3>
                         <span className="account-title">{accountTitle}</span>
@@ -2728,23 +3028,98 @@ function App() {
                         {authAccount.auth_mode ?? "chatgpt"} · 最近使用{" "}
                         {formatUnixTime(authAccount.last_used_at)}
                       </p>
+                      {isInvalid ? (
+                        <p
+                          className="account-invalid-message"
+                          title={authAccount.invalid_reason ?? undefined}
+                        >
+                          上次验证失败 · {formatUnixTime(authAccount.invalid_at)}
+                        </p>
+                      ) : null}
                     </div>
-                    {isActiveAccount ? (
-                      <span className="status-pill tone-connected">当前</span>
-                    ) : (
-                      <button
-                        type="button"
-                        className="chip"
-                        disabled={
-                          Boolean(switchingAccountKey) ||
-                          isSavingAccount ||
-                          isRestartingCodexClient
-                        }
-                        onClick={() => void handleSwitchAccount(authAccount.account_key)}
-                      >
-                        {isSwitching ? "切换中..." : "切换"}
-                      </button>
-                    )}
+                    <div className="account-card-actions">
+                      <div className="account-statuses">
+                        {isActiveAccount ? (
+                          <span className="status-pill tone-connected">当前</span>
+                        ) : null}
+                        {isInvalid ? (
+                          <span className="status-pill tone-error">需要重新登录</span>
+                        ) : null}
+                      </div>
+                      {!isActiveAccount ? (
+                        <button
+                          type="button"
+                          className="chip"
+                          disabled={
+                            Boolean(switchingAccountKey) ||
+                            Boolean(deletingAccountKey) ||
+                            Boolean(accountLoginFlow) ||
+                            isSavingAccount ||
+                            isRestartingCodexClient
+                          }
+                          onClick={() => void handleSwitchAccount(authAccount.account_key)}
+                        >
+                          {isSwitching ? "切换中..." : "切换"}
+                        </button>
+                      ) : null}
+                      {isInvalid ? (
+                        <button
+                          type="button"
+                          className="chip account-relogin-button"
+                          disabled={
+                            Boolean(switchingAccountKey) ||
+                            Boolean(deletingAccountKey) ||
+                            Boolean(accountLoginFlow) ||
+                            isStartingAccountLogin ||
+                            isRestartingCodexClient
+                          }
+                          onClick={() => {
+                            setConfirmingDeleteAccountKey(null);
+                            void handleStartAccountLogin(authAccount.account_key);
+                          }}
+                        >
+                          重新登录
+                        </button>
+                      ) : null}
+                      {!isActiveAccount && isConfirmingDelete ? (
+                        <div className="account-delete-confirm">
+                          <button
+                            type="button"
+                            className="chip danger"
+                            disabled={isDeleting}
+                            onClick={() =>
+                              void handleDeleteAccount(authAccount.account_key)
+                            }
+                          >
+                            {isDeleting ? "删除中..." : "确认删除"}
+                          </button>
+                          <button
+                            type="button"
+                            className="chip"
+                            disabled={isDeleting}
+                            onClick={() => setConfirmingDeleteAccountKey(null)}
+                          >
+                            取消
+                          </button>
+                        </div>
+                      ) : !isActiveAccount ? (
+                        <button
+                          type="button"
+                          className="chip account-delete-button"
+                          disabled={
+                            Boolean(switchingAccountKey) ||
+                            Boolean(deletingAccountKey) ||
+                            Boolean(accountLoginFlow) ||
+                            isRestartingCodexClient
+                          }
+                          onClick={() =>
+                            setConfirmingDeleteAccountKey(authAccount.account_key)
+                          }
+                        >
+                          删除
+                        </button>
+                      ) : null}
+                    </div>
                   </article>
                 );
               })}
@@ -2752,7 +3127,7 @@ function App() {
           )}
 
           <p className="hint">
-            安装包已内置官方 Codex 登录服务，无需安装 CLI。新增和切换只读写本机账号快照；切换失败时会自动恢复原账号。
+            安装包已内置官方 Codex 登录服务，无需安装 CLI。切换验证失败会保留原账号并标记目标账号；重新登录可刷新快照，删除只对非当前账号开放。
           </p>
         </section>
       ) : null}

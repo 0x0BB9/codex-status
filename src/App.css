@@ -777,6 +777,68 @@ code {
     rgba(var(--panel-rgb), 0.96);
 }
 
+.update-complete-banner {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 0.65rem;
+  border: 1px solid rgba(var(--ok-rgb), 0.46);
+  border-radius: 9px;
+  padding: 0.7rem;
+  background:
+    linear-gradient(120deg, rgba(var(--ok-rgb), 0.14), transparent 68%),
+    rgba(var(--panel-rgb), 0.97);
+  box-shadow: 0 10px 24px rgba(var(--ok-rgb), 0.1);
+}
+
+.update-complete-mark {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-radius: 50%;
+  background: rgba(var(--ok-rgb), 0.16);
+  color: var(--ok);
+  font-weight: 800;
+}
+
+.update-complete-content {
+  display: grid;
+  gap: 0.1rem;
+  min-width: 0;
+}
+
+.update-complete-content > span {
+  color: var(--ok);
+  font-size: 0.7rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+.update-complete-content strong {
+  font-size: 0.88rem;
+}
+
+.update-complete-content p {
+  margin: 0.18rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  line-height: 1.45;
+  white-space: pre-line;
+}
+
+.update-complete-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.update-complete-actions button {
+  min-height: 28px;
+  padding: 0.2rem 0.48rem;
+  font-size: 0.72rem;
+}
+
 .subtitle,
 .section-note,
 .hint,
@@ -1028,6 +1090,53 @@ code {
   margin: 0.25rem 0 0;
   color: var(--text-muted);
   font-size: 0.82rem;
+}
+
+.account-card-invalid {
+  border-color: rgba(var(--danger-rgb), 0.5);
+  background:
+    linear-gradient(135deg, rgba(var(--danger-rgb), 0.08), transparent 52%),
+    var(--surface);
+}
+
+.account-card .account-invalid-message {
+  color: var(--danger);
+  font-size: 0.74rem;
+}
+
+.account-card-actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.35rem;
+}
+
+.account-statuses,
+.account-delete-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.3rem;
+}
+
+.account-relogin-button {
+  border-color: rgba(var(--warn-rgb), 0.45);
+  color: var(--warn);
+}
+
+.account-delete-button {
+  min-height: 24px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.74rem;
+}
+
+.chip.danger {
+  border-color: rgba(var(--danger-rgb), 0.5);
+  background: rgba(var(--danger-rgb), 0.1);
+  color: var(--danger);
 }
 
 .usage-header p,
@@ -1535,5 +1644,25 @@ code {
 
   .usage-badge-stack {
     justify-items: start;
+  }
+
+  .update-complete-banner {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .update-complete-actions {
+    grid-column: 2;
+  }
+
+  .account-card-actions {
+    width: 100%;
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .account-statuses,
+  .account-delete-confirm {
+    justify-content: flex-start;
   }
 }

@@ -9,6 +9,8 @@ export type StoredCodexAccount = {
   chatgpt_user_id?: string | null;
   created_at?: number | null;
   email?: string | null;
+  invalid_at?: number | null;
+  invalid_reason?: string | null;
   last_used_at?: number | null;
   plan?: string | null;
 };
@@ -49,6 +51,28 @@ export async function saveCurrentCodexAccount(alias?: string) {
 
 export async function switchLocalCodexAccount(accountKey: string) {
   return invoke<AccountSwitchResult>("switch_local_codex_account", {
+    accountKey,
+  });
+}
+
+export async function markLocalCodexAccountInvalid(
+  accountKey: string,
+  reason: string,
+) {
+  return invoke<StoredCodexRegistry>("mark_local_codex_account_invalid", {
+    accountKey,
+    reason,
+  });
+}
+
+export async function clearLocalCodexAccountInvalid(accountKey: string) {
+  return invoke<StoredCodexRegistry>("clear_local_codex_account_invalid", {
+    accountKey,
+  });
+}
+
+export async function deleteLocalCodexAccount(accountKey: string) {
+  return invoke<StoredCodexRegistry>("delete_local_codex_account", {
     accountKey,
   });
 }

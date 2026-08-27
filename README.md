@@ -14,6 +14,7 @@ Packaged builds include the official Codex native binary as a local sidecar, so 
 
 - account mode and plan summary
 - saved local Codex accounts with one-click switching
+- invalid-account markers with re-login and safe deletion for inactive accounts
 - short-window and long-window usage, reset times, and available reset-credit expirations
 - recent threads sorted by latest activity
 - local task board metadata: pinned threads, notes, project, priority, and stage
@@ -21,6 +22,7 @@ Packaged builds include the official Codex native binary as a local sidecar, so 
 - tray menu controls, a global window toggle, transparent floating, and edge snapping
 - right-edge auto-collapse into a small usage capsule with click-to-expand
 - signed in-app update checks, installation, and relaunch on Windows and macOS
+- a one-time post-update summary with release notes
 - a tiny local server log when the app launches `codex app-server` itself
 
 ## Account Switching
@@ -34,6 +36,7 @@ The app implements local account switching itself. It does not require `codex-au
 - Clicking "保存当前账号" stores the currently logged-in Codex auth as a local snapshot.
 - Clicking "切换" first saves the active account's latest tokens, replaces `auth.json`, then restarts app-server and verifies the existing login without forcing refresh-token rotation.
 - Failed verification automatically restores the previous account instead of leaving Codex signed out.
+- Failed target accounts are marked for re-login. A successful official login clears the marker, while inactive accounts can be deleted after confirmation.
 - The account panel can restart the official Codex desktop client on macOS or Windows after a verified switch. Newer ChatGPT desktop builds may keep a separate host session that still needs confirmation inside the official client.
 
 See [docs/account-switching.md](docs/account-switching.md) for the full file layout, switching flow, backups, compatibility notes, and limitations.
@@ -59,6 +62,7 @@ Release notes and version history are available in [CHANGELOG.md](CHANGELOG.md).
 Click the version badge in the header to check for updates. The app also performs one silent check after startup.
 
 - Windows and macOS download and install signed updater artifacts in-app, then relaunch.
+- After relaunch, the app shows the completed version transition and release notes once.
 - On macOS, copy the app to `/Applications` before using in-app updates; do not run it directly from the DMG.
 - macOS must be upgraded manually once to the first release that supports automatic installation; later releases can update in-app.
 

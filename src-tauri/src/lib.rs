@@ -50,11 +50,13 @@ struct StoredCodexAccount {
     auth_mode: Option<String>,
     created_at: Option<i64>,
     last_used_at: Option<i64>,
+    invalid_at: Option<i64>,
+    invalid_reason: Option<String>,
     #[serde(flatten)]
     extra: Map<String, Value>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct StoredCodexRegistry {
     schema_version: Option<u32>,
     active_account_key: Option<String>,
@@ -182,7 +184,7 @@ fn read_registry() -> Result<StoredCodexRegistry, String> {
     let path = registry_path()?;
     if !path.exists() {
         return Ok(StoredCodexRegistry {
-            schema_version: Some(3),
+            schema_version: Some(4),
             ..StoredCodexRegistry::default()
         });
     }
@@ -844,6 +846,91 @@ fn list_local_codex_accounts() -> Result<StoredCodexRegistry, String> {
     read_registry()
 }
 
+fn set_account_invalid_state(
+    registry: &mut StoredCodexRegistry,
+    account_key: &str,
+    reason: Option<&str>,
+) -> Result<(), String> {
+    let account = registry
+        .accounts
+        .iter_mut()
+        .find(|account| account.account_key == account_key)
+        .ok_or_else(|| "Account is not saved in the local registry.".to_string())?;
+
+    if let Some(reason) = reason {
+        account.invalid_at = Some(now_unix_seconds());
+        account.invalid_reason = Some(reason.trim().chars().take(240).collect());
+    } else {
+        account.invalid_at = None;
+        account.invalid_reason = None;
+    }
+    registry.schema_version = Some(registry.schema_version.unwrap_or(4).max(4));
+    Ok(())
+}
+
+#[tauri::command]
+fn mark_local_codex_account_invalid(
+    account_key: String,
+    reason: String,
+) -> Result<StoredCodexRegistry, String> {
+    let mut registry = read_registry()?;
+    set_account_invalid_state(&mut registry, &account_key, Some(&reason))?;
+    write_registry(&registry)?;
+
+    Ok(registry)
+}
+
+#[tauri::command]
+fn clear_local_codex_account_invalid(account_key: String) -> Result<StoredCodexRegistry, String> {
+    let mut registry = read_registry()?;
+    set_account_invalid_state(&mut registry, &account_key, None)?;
+    write_registry(&registry)?;
+
+    Ok(registry)
+}
+
+fn remove_inactive_account(
+    registry: &mut StoredCodexRegistry,
+    account_key: &str,
+) -> Result<(), String> {
+    if registry.active_account_key.as_deref() == Some(account_key) {
+        return Err("The active account cannot be deleted.".to_string());
+    }
+
+    let account_index = registry
+        .accounts
+        .iter()
+        .position(|account| account.account_key == account_key)
+        .ok_or_else(|| "Account is not saved in the local registry.".to_string())?;
+    registry.accounts.remove(account_index);
+    registry.schema_version = Some(registry.schema_version.unwrap_or(4).max(4));
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_local_codex_account(account_key: String) -> Result<StoredCodexRegistry, String> {
+    let mut registry = read_registry()?;
+    let previous_registry = registry.clone();
+    remove_inactive_account(&mut registry, &account_key)?;
+    write_registry(&registry)?;
+
+    let account_path = account_auth_path(&account_key)?;
+    if account_path.exists() {
+        if let Err(error) = fs::remove_file(&account_path) {
+            let rollback_error = write_registry(&previous_registry).err();
+            return Err(match rollback_error {
+                Some(rollback_error) => format!(
+                    "Unable to delete {}: {error}; registry rollback also failed: {rollback_error}",
+                    account_path.display()
+                ),
+                None => format!("Unable to delete {}: {error}", account_path.display()),
+            });
+        }
+    }
+
+    Ok(registry)
+}
+
 fn configure_file_auth_credentials_store(existing_content: &str) -> Result<(String, bool), String> {
     let mut document = if existing_content.trim().is_empty() {
         DocumentMut::new()
@@ -909,7 +996,7 @@ fn save_current_codex_account(
     params: Option<SaveCurrentAccountParams>,
 ) -> Result<StoredCodexRegistry, String> {
     let mut registry = read_registry()?;
-    registry.schema_version = registry.schema_version.or(Some(3));
+    registry.schema_version = Some(registry.schema_version.unwrap_or(4).max(4));
 
     let auth_path = active_auth_path()?;
     let auth = read_auth_file(&auth_path)?;
@@ -1233,6 +1320,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_local_codex_accounts,
+            mark_local_codex_account_invalid,
+            clear_local_codex_account_invalid,
+            delete_local_codex_account,
             ensure_file_auth_credentials_store,
             save_current_codex_account,
             switch_local_codex_account,
@@ -1249,7 +1339,10 @@ pub fn run() {
 mod tests {
     #[cfg(target_os = "macos")]
     use super::macos_app_bundle_from_executable;
-    use super::{configure_file_auth_credentials_store, parse_reset_credits, reset_credits_auth};
+    use super::{
+        configure_file_auth_credentials_store, parse_reset_credits, remove_inactive_account,
+        reset_credits_auth, set_account_invalid_state, StoredCodexAccount, StoredCodexRegistry,
+    };
     #[cfg(target_os = "macos")]
     use std::path::{Path, PathBuf};
 
@@ -1316,6 +1409,55 @@ mod tests {
 
         assert_eq!(parsed.access_token, "header.payload.signature");
         assert_eq!(parsed.account_id.as_deref(), Some("account-123"));
+    }
+
+    #[test]
+    fn removes_only_inactive_saved_accounts() {
+        let mut registry = StoredCodexRegistry {
+            active_account_key: Some("active".to_string()),
+            accounts: vec![
+                StoredCodexAccount {
+                    account_key: "active".to_string(),
+                    ..StoredCodexAccount::default()
+                },
+                StoredCodexAccount {
+                    account_key: "inactive".to_string(),
+                    ..StoredCodexAccount::default()
+                },
+            ],
+            ..StoredCodexRegistry::default()
+        };
+
+        assert!(remove_inactive_account(&mut registry, "active").is_err());
+        remove_inactive_account(&mut registry, "inactive")
+            .expect("inactive account should be removed");
+        assert_eq!(registry.accounts.len(), 1);
+        assert_eq!(registry.accounts[0].account_key, "active");
+        assert_eq!(registry.schema_version, Some(4));
+    }
+
+    #[test]
+    fn marks_and_clears_invalid_account_state() {
+        let mut registry = StoredCodexRegistry {
+            accounts: vec![StoredCodexAccount {
+                account_key: "target".to_string(),
+                ..StoredCodexAccount::default()
+            }],
+            ..StoredCodexRegistry::default()
+        };
+
+        set_account_invalid_state(&mut registry, "target", Some("  token expired  "))
+            .expect("account should be marked invalid");
+        assert!(registry.accounts[0].invalid_at.is_some());
+        assert_eq!(
+            registry.accounts[0].invalid_reason.as_deref(),
+            Some("token expired")
+        );
+
+        set_account_invalid_state(&mut registry, "target", None)
+            .expect("invalid state should clear");
+        assert_eq!(registry.accounts[0].invalid_at, None);
+        assert_eq!(registry.accounts[0].invalid_reason, None);
     }
 
     #[cfg(target_os = "macos")]
