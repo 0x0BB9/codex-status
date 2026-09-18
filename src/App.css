@@ -877,7 +877,8 @@ code {
 }
 
 .account-login-box,
-.account-restart-box {
+.account-restart-box,
+.api-connection-form {
   display: grid;
   gap: 0.55rem;
   margin-bottom: 0.7rem;
@@ -897,6 +898,85 @@ code {
   background:
     linear-gradient(135deg, rgba(var(--warn-rgb), 0.07), transparent 52%),
     rgba(var(--panel-rgb), 0.82);
+}
+
+.api-connection-form {
+  border: 1px solid rgba(var(--accent-rgb), 0.3);
+  background:
+    linear-gradient(135deg, rgba(var(--accent-rgb), 0.09), transparent 58%),
+    rgba(var(--panel-rgb), 0.88);
+}
+
+.api-connection-heading,
+.api-connection-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.api-connection-heading > div {
+  display: grid;
+  gap: 0.12rem;
+}
+
+.api-connection-heading strong,
+.api-connection-grid span {
+  color: var(--text-main);
+  font-size: 0.82rem;
+}
+
+.api-connection-heading small {
+  color: var(--text-muted);
+  font-size: 0.74rem;
+  line-height: 1.35;
+}
+
+.file-import-button {
+  position: relative;
+  flex: 0 0 auto;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  padding: 0.42rem 0.65rem;
+  background: var(--surface);
+  color: var(--text-main);
+  cursor: pointer;
+  font-size: 0.76rem;
+}
+
+.file-import-button input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.api-connection-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.5rem;
+}
+
+.api-connection-grid label {
+  display: grid;
+  gap: 0.28rem;
+}
+
+.api-connection-grid .api-field-wide {
+  grid-column: 1 / -1;
+}
+
+.api-connection-grid input {
+  min-width: 0;
+}
+
+.api-billing-panel {
+  border-color: rgba(var(--info-rgb), 0.35);
+  background:
+    linear-gradient(135deg, rgba(var(--info-rgb), 0.08), transparent 55%),
+    rgba(var(--panel-rgb), 0.94);
 }
 
 .account-login-box > div:first-child {
@@ -1659,6 +1739,20 @@ code {
     flex-direction: row;
     align-items: center;
     flex-wrap: wrap;
+  }
+
+  .api-connection-heading,
+  .api-connection-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .api-connection-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .api-connection-grid .api-field-wide {
+    grid-column: auto;
   }
 
   .account-statuses,

@@ -5,12 +5,16 @@ import type {
 } from "../generated";
 import type {
   CancelLoginAccountResponse,
+  ConfigReadParams,
+  ConfigReadResponse,
   GetAccountResponse,
   GetAccountRateLimitsResponse,
   LoginAccountParams,
   LoginAccountResponse,
   ThreadListParams,
   ThreadListResponse,
+  ThreadStartParams,
+  ThreadStartResponse,
 } from "../generated/v2";
 
 type PendingRequest = {
@@ -219,6 +223,14 @@ export class CodexAppServerShellClient {
 
   listThreads(params: ThreadListParams) {
     return this.request<ThreadListResponse>("thread/list", params);
+  }
+
+  readConfig(params: ConfigReadParams = {}) {
+    return this.request<ConfigReadResponse>("config/read", params);
+  }
+
+  startThread(params: ThreadStartParams) {
+    return this.request<ThreadStartResponse>("thread/start", params);
   }
 
   request<T>(method: ClientRequest["method"], params?: unknown) {

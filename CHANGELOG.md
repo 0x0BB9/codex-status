@@ -6,6 +6,31 @@
 
 暂无。
 
+## [0.1.16] - 2026-09-18
+
+### 修复
+
+- 修复 API 模型沿用旧 Plus 任务的 `openai` provider，导致第三方 Key 被错误发送到 `api.openai.com` 并返回 401 的问题。
+- 切换 API 连接后创建并打开 provider 正确的独立新任务，原 Plus 任务保持原有关联。
+
+### 安全
+
+- API Key 长期保存在系统凭据库；激活时仅写入权限为当前用户可读的 provider 配置，不再覆盖 Plus 的 `auth.json`。
+- 连接备份会自动剔除 provider bearer token，切回 Plus 后活动配置不再保留 API Key。
+
+## [0.1.15] - 2026-09-18
+
+### 新增
+
+- 支持从两列 CSV 或手动输入添加 OpenAI Responses 兼容 API 连接，并在 Plus 账号与 API 连接之间切换。
+- API Key 长期保存到系统凭据库，账号索引只保留末四位提示；连接测试只读取模型列表，不产生推理费用。
+- API 连接激活时自动生成 Codex 模型目录，确保自定义模型可被 app-server 识别和恢复。
+
+### 安全
+
+- 切换前后检查全部 provider 的未归档线程数量；数量减少时自动恢复原连接，不修改线程数据库中的 provider。
+- 配置、认证、模型目录和账号索引采用事务式写入与失败回滚；切换回 Plus 时恢复原模型配置。
+
 ## [0.1.14] - 2026-08-27
 
 ### 新增
@@ -133,6 +158,8 @@
 - 账号凭据只保存在用户本机的 `~/.codex` 目录，不写入仓库或安装包。
 - 切换账号前备份当前鉴权文件，验证失败时自动恢复原账号。
 
+[0.1.16]: https://github.com/0x0BB9/codex-status/releases/tag/v0.1.16
+[0.1.15]: https://github.com/0x0BB9/codex-status/releases/tag/v0.1.15
 [0.1.14]: https://github.com/0x0BB9/codex-status/releases/tag/v0.1.14
 [0.1.13]: https://github.com/0x0BB9/codex-status/releases/tag/v0.1.13
 [0.1.12]: https://github.com/0x0BB9/codex-status/releases/tag/v0.1.12

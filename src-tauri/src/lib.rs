@@ -21,7 +21,7 @@ use tauri::{
     AppHandle, Manager, Runtime, WebviewWindow, WindowEvent,
 };
 use tauri_plugin_global_shortcut::ShortcutState;
-use toml_edit::{value, DocumentMut};
+use toml_edit::{value, DocumentMut, Item, Table};
 
 const MAIN_WINDOW_LABEL: &str = "main";
 #[cfg(target_os = "macos")]
@@ -31,6 +31,8 @@ const CODEX_DESKTOP_PROCESS_NAMES: [&str; 2] = ["ChatGPT", "Codex"];
 const TRAY_MENU_TOGGLE: &str = "toggle-window";
 const TRAY_MENU_QUIT: &str = "quit";
 const RESET_CREDITS_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+const API_KEYRING_SERVICE: &str = "io.github.codexstatus.floater.api-connections";
+const API_PROVIDER_PREFIX: &str = "status_floater_api_";
 const MAX_AUTH_BYTES: u64 = 256 * 1024;
 const MAX_QUOTA_RESPONSE_BYTES: u64 = 1024 * 1024;
 #[cfg(target_os = "windows")]
@@ -52,6 +54,14 @@ struct StoredCodexAccount {
     last_used_at: Option<i64>,
     invalid_at: Option<i64>,
     invalid_reason: Option<String>,
+    connection_kind: Option<String>,
+    provider_id: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
+    workspace_name: Option<String>,
+    workspace_id: Option<String>,
+    key_hint: Option<String>,
+    secret_id: Option<String>,
     #[serde(flatten)]
     extra: Map<String, Value>,
 }
@@ -85,6 +95,25 @@ struct AuthStorageConfigResult {
     backup_path: Option<String>,
     changed: bool,
     config_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveApiConnectionParams {
+    profile_id: Option<String>,
+    label: String,
+    api_key: String,
+    base_url: String,
+    model: String,
+    workspace_name: Option<String>,
+    workspace_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiConnectionTestResult {
+    model_count: usize,
+    model_found: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -178,6 +207,18 @@ fn floater_state_dir() -> Result<PathBuf, String> {
 
 fn thread_board_path() -> Result<PathBuf, String> {
     Ok(floater_state_dir()?.join("thread-board.json"))
+}
+
+fn chatgpt_config_snapshot_path() -> Result<PathBuf, String> {
+    Ok(floater_state_dir()?.join("chatgpt-config.toml"))
+}
+
+fn connection_backups_dir() -> Result<PathBuf, String> {
+    Ok(floater_state_dir()?.join("connection-backups"))
+}
+
+fn api_model_catalogs_dir() -> Result<PathBuf, String> {
+    Ok(floater_state_dir()?.join("model-catalogs"))
 }
 
 fn read_registry() -> Result<StoredCodexRegistry, String> {
@@ -565,28 +606,318 @@ fn stable_hash(input: &str) -> String {
     format!("{hash:016x}")
 }
 
-fn backup_active_auth() -> Result<Option<PathBuf>, String> {
-    let auth_path = active_auth_path()?;
-    if !auth_path.exists() {
-        return Ok(None);
+fn is_api_connection(account: &StoredCodexAccount) -> bool {
+    account.connection_kind.as_deref() == Some("api")
+}
+
+fn active_account_is_api(registry: &StoredCodexRegistry) -> bool {
+    registry
+        .active_account_key
+        .as_deref()
+        .and_then(|active_key| {
+            registry
+                .accounts
+                .iter()
+                .find(|account| account.account_key == active_key)
+        })
+        .is_some_and(is_api_connection)
+}
+
+fn api_secret_entry(secret_id: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(API_KEYRING_SERVICE, secret_id)
+        .map_err(|_| "无法访问系统凭据库。".to_string())
+}
+
+fn store_api_secret(secret_id: &str, api_key: &str) -> Result<(), String> {
+    api_secret_entry(secret_id)?
+        .set_password(api_key)
+        .map_err(|_| "无法将 API Key 保存到系统凭据库。".to_string())
+}
+
+fn read_api_secret(secret_id: &str) -> Result<String, String> {
+    api_secret_entry(secret_id)?
+        .get_password()
+        .map_err(|_| "系统凭据库中找不到该连接的 API Key，请重新导入。".to_string())
+}
+
+fn delete_api_secret(secret_id: &str) -> Result<(), String> {
+    match api_secret_entry(secret_id)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(_) => Err("无法从系统凭据库删除 API Key。".to_string()),
+    }
+}
+
+fn normalize_optional_text(value: Option<String>, max_chars: usize) -> Option<String> {
+    value
+        .map(|value| value.trim().chars().take(max_chars).collect::<String>())
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_api_connection_params(
+    params: SaveApiConnectionParams,
+) -> Result<(SaveApiConnectionParams, String), String> {
+    let label = params.label.trim().chars().take(80).collect::<String>();
+    if label.is_empty() {
+        return Err("请填写连接名称。".to_string());
     }
 
-    let backup_path = accounts_dir()?.join(format!("auth.json.bak.{}", now_unix_millis()));
-    fs::create_dir_all(
-        backup_path
-            .parent()
-            .ok_or_else(|| format!("Invalid backup path: {}", backup_path.display()))?,
-    )
-    .map_err(|error| format!("Unable to create backup directory: {error}"))?;
-    fs::copy(&auth_path, &backup_path).map_err(|error| {
-        format!(
-            "Unable to back up {} to {}: {error}",
-            auth_path.display(),
-            backup_path.display()
-        )
-    })?;
+    let api_key = params.api_key.trim().to_string();
+    if api_key.len() < 8 || api_key.len() > 4096 || api_key.chars().any(char::is_whitespace) {
+        return Err("API Key 格式不正确。".to_string());
+    }
 
-    Ok(Some(backup_path))
+    let mut base_url = reqwest::Url::parse(params.base_url.trim())
+        .map_err(|_| "Base URL 格式不正确。".to_string())?;
+    if base_url.scheme() != "https"
+        || base_url.host_str().is_none()
+        || !base_url.username().is_empty()
+        || base_url.password().is_some()
+        || base_url.query().is_some()
+        || base_url.fragment().is_some()
+    {
+        return Err("Base URL 必须是不含账号、查询参数和片段的 HTTPS 地址。".to_string());
+    }
+    let normalized_path = base_url.path().trim_end_matches('/').to_string();
+    base_url.set_path(if normalized_path.is_empty() {
+        "/"
+    } else {
+        &normalized_path
+    });
+    let base_url = base_url.as_str().trim_end_matches('/').to_string();
+
+    let model = params.model.trim().to_string();
+    if model.is_empty()
+        || model.len() > 160
+        || !model
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-._/:".contains(character))
+    {
+        return Err("模型 ID 格式不正确。".to_string());
+    }
+
+    let profile_seed = format!(
+        "{}|{}",
+        base_url,
+        params.workspace_id.as_deref().unwrap_or_default().trim()
+    );
+    let generated_profile_id = format!("api-profile::{}", stable_hash(&profile_seed));
+    let normalized = SaveApiConnectionParams {
+        profile_id: params.profile_id,
+        label,
+        api_key,
+        base_url,
+        model,
+        workspace_name: normalize_optional_text(params.workspace_name, 120),
+        workspace_id: normalize_optional_text(params.workspace_id, 160),
+    };
+
+    Ok((normalized, generated_profile_id))
+}
+
+fn configure_api_provider(
+    existing_content: &str,
+    account: &StoredCodexAccount,
+    model_catalog_path: &Path,
+    api_key: &str,
+) -> Result<String, String> {
+    let provider_id = account
+        .provider_id
+        .as_deref()
+        .ok_or_else(|| "API 连接缺少 provider 配置。".to_string())?;
+    let base_url = account
+        .base_url
+        .as_deref()
+        .ok_or_else(|| "API 连接缺少 Base URL。".to_string())?;
+    let model = account
+        .model
+        .as_deref()
+        .ok_or_else(|| "API 连接缺少模型 ID。".to_string())?;
+    let mut document = if existing_content.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        existing_content
+            .parse::<DocumentMut>()
+            .map_err(|error| format!("Invalid Codex config TOML: {error}"))?
+    };
+
+    document["model"] = value(model);
+    document["model_provider"] = value(provider_id);
+    document["model_catalog_json"] = value(model_catalog_path.display().to_string());
+    document["cli_auth_credentials_store"] = value("file");
+
+    if !document.contains_key("model_providers") {
+        document["model_providers"] = Item::Table(Table::new());
+    }
+    let providers = document["model_providers"]
+        .as_table_mut()
+        .ok_or_else(|| "Codex config 中的 model_providers 不是有效表。".to_string())?;
+    let mut provider = Table::new();
+    provider["name"] = value(
+        account
+            .alias
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("API connection"),
+    );
+    provider["base_url"] = value(base_url);
+    provider["wire_api"] = value("responses");
+    provider["requires_openai_auth"] = value(false);
+    provider["experimental_bearer_token"] = value(api_key);
+    providers.insert(provider_id, Item::Table(provider));
+
+    Ok(document.to_string())
+}
+
+fn redact_api_provider_secrets(existing_content: &str) -> Result<String, String> {
+    if existing_content.trim().is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut document = existing_content
+        .parse::<DocumentMut>()
+        .map_err(|error| format!("Invalid Codex config TOML: {error}"))?;
+    if let Some(providers) = document
+        .get_mut("model_providers")
+        .and_then(Item::as_table_mut)
+    {
+        for (_, provider) in providers.iter_mut() {
+            if let Some(provider) = provider.as_table_mut() {
+                provider.remove("experimental_bearer_token");
+            }
+        }
+    }
+
+    Ok(document.to_string())
+}
+
+fn api_model_catalog_path(account: &StoredCodexAccount) -> Result<PathBuf, String> {
+    let provider_id = account
+        .provider_id
+        .as_deref()
+        .ok_or_else(|| "API 连接缺少 provider 配置。".to_string())?;
+    if !provider_id
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return Err("API 连接的 provider 标识无效。".to_string());
+    }
+
+    Ok(api_model_catalogs_dir()?.join(format!("{provider_id}.json")))
+}
+
+fn build_api_model_catalog(account: &StoredCodexAccount) -> Result<Value, String> {
+    let model = account
+        .model
+        .as_deref()
+        .ok_or_else(|| "API 连接缺少模型 ID。".to_string())?;
+    let display_name = account
+        .alias
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(model);
+
+    Ok(serde_json::json!({
+        "models": [{
+            "slug": model,
+            "display_name": display_name,
+            "description": "Custom Responses API model managed by Codex Status Floater.",
+            "default_reasoning_level": "medium",
+            "supported_reasoning_levels": [],
+            "shell_type": "shell_command",
+            "visibility": "list",
+            "supported_in_api": true,
+            "priority": 1,
+            "base_instructions": "You are a coding assistant. Use the available tools carefully and follow the user's instructions.",
+            "supports_parallel_tool_calls": false,
+            "support_verbosity": false,
+            "truncation_policy": {
+                "mode": "tokens",
+                "limit": 10000
+            },
+            "experimental_supported_tools": []
+        }]
+    }))
+}
+
+fn write_api_model_catalog(account: &StoredCodexAccount) -> Result<PathBuf, String> {
+    let path = api_model_catalog_path(account)?;
+    write_json_file(&path, &build_api_model_catalog(account)?)?;
+    Ok(path)
+}
+
+fn restore_file(path: &Path, content: Option<&[u8]>) -> Result<(), String> {
+    match content {
+        Some(content) => write_private_file(path, content),
+        None if path.exists() => fs::remove_file(path)
+            .map_err(|error| format!("Unable to remove {}: {error}", path.display())),
+        None => Ok(()),
+    }
+}
+
+fn backup_connection_state(skip_auth: bool) -> Result<PathBuf, String> {
+    let backup_root = connection_backups_dir()?.join(format!("switch-{}", now_unix_millis()));
+    ensure_private_directory(&backup_root)?;
+
+    for (source, filename) in [
+        (codex_config_path()?, "config.toml"),
+        (registry_path()?, "registry.json"),
+    ] {
+        if source.exists() {
+            let mut content = fs::read(&source)
+                .map_err(|error| format!("Unable to read {}: {error}", source.display()))?;
+            if filename == "config.toml" {
+                content =
+                    redact_api_provider_secrets(&String::from_utf8_lossy(&content))?.into_bytes();
+            }
+            write_private_file(&backup_root.join(filename), &content)?;
+        }
+    }
+
+    let auth_path = active_auth_path()?;
+    if !skip_auth && auth_path.exists() {
+        let content = fs::read(&auth_path)
+            .map_err(|error| format!("Unable to read {}: {error}", auth_path.display()))?;
+        write_private_file(&backup_root.join("auth.json"), &content)?;
+    }
+
+    Ok(backup_root)
+}
+
+fn auth_contains_chatgpt_tokens(content: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(content)
+        .ok()
+        .and_then(|auth| auth.get("tokens").cloned())
+        .is_some_and(|tokens| tokens.is_object())
+}
+
+fn chatgpt_auth_for_api_switch(
+    registry: &StoredCodexRegistry,
+    current_auth: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    if let Some(current_auth) = current_auth.filter(|auth| auth_contains_chatgpt_tokens(auth)) {
+        return Ok(current_auth.to_vec());
+    }
+
+    let mut candidates = registry
+        .accounts
+        .iter()
+        .filter(|account| !is_api_connection(account))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|account| std::cmp::Reverse(account.last_used_at.unwrap_or_default()));
+
+    for account in candidates {
+        let path = account_auth_path(&account.account_key)?;
+        let Ok(content) = fs::read(path) else {
+            continue;
+        };
+        if auth_contains_chatgpt_tokens(&content) {
+            return Ok(content);
+        }
+    }
+
+    current_auth.map(ToOwned::to_owned).ok_or_else(|| {
+        "找不到可保留的 Codex 登录状态，请先登录一个 Plus 账号后再切换 API 连接。".to_string()
+    })
 }
 
 fn derive_account_from_auth(
@@ -660,6 +991,7 @@ fn derive_account_from_auth(
     account.email = email.or(account.email);
     account.account_name = account_name.or(account.account_name);
     account.auth_mode = Some(auth_mode);
+    account.connection_kind = Some("chatgpt".to_string());
     account.last_used_at = Some(now);
 
     if let Some(alias) = alias
@@ -911,8 +1243,30 @@ fn remove_inactive_account(
 fn delete_local_codex_account(account_key: String) -> Result<StoredCodexRegistry, String> {
     let mut registry = read_registry()?;
     let previous_registry = registry.clone();
+    let removed_account = registry
+        .accounts
+        .iter()
+        .find(|account| account.account_key == account_key)
+        .cloned()
+        .ok_or_else(|| "Account is not saved in the local registry.".to_string())?;
     remove_inactive_account(&mut registry, &account_key)?;
     write_registry(&registry)?;
+
+    if let Some(secret_id) = removed_account
+        .secret_id
+        .as_deref()
+        .filter(|_| is_api_connection(&removed_account))
+    {
+        if let Err(error) = delete_api_secret(secret_id) {
+            let rollback_error = write_registry(&previous_registry).err();
+            return Err(match rollback_error {
+                Some(rollback_error) => {
+                    format!("{error} 账号列表回滚也失败：{rollback_error}")
+                }
+                None => error,
+            });
+        }
+    }
 
     let account_path = account_auth_path(&account_key)?;
     if account_path.exists() {
@@ -928,7 +1282,185 @@ fn delete_local_codex_account(account_key: String) -> Result<StoredCodexRegistry
         }
     }
 
+    if is_api_connection(&removed_account) {
+        if let Ok(catalog_path) = api_model_catalog_path(&removed_account) {
+            let _ = fs::remove_file(catalog_path);
+        }
+    }
+
     Ok(registry)
+}
+
+async fn test_api_connection_values(
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+) -> Result<ApiConnectionTestResult, String> {
+    let mut bearer = HeaderValue::from_str(&format!("Bearer {api_key}"))
+        .map_err(|_| "API Key 格式不正确。".to_string())?;
+    bearer.set_sensitive(true);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("CodexStatusFloater/0.1")
+        .build()
+        .map_err(|_| "无法初始化 API 连接测试。".to_string())?;
+    let response = client
+        .get(format!("{base_url}/models"))
+        .header(AUTHORIZATION, bearer)
+        .header(ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|_| "无法连接 API 服务，请检查网络和 Base URL。".to_string())?;
+
+    match response.status().as_u16() {
+        200..=299 => {}
+        401 | 403 => return Err("API Key 无效或无权访问该工作空间。".to_string()),
+        429 => return Err("API 服务请求频繁或额度不足。".to_string()),
+        status => return Err(format!("API 服务返回 HTTP {status}。")),
+    }
+
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_QUOTA_RESPONSE_BYTES)
+    {
+        return Err("模型列表响应过大。".to_string());
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| "读取模型列表失败。".to_string())?;
+    if bytes.len() as u64 > MAX_QUOTA_RESPONSE_BYTES {
+        return Err("模型列表响应过大。".to_string());
+    }
+    let payload: Value =
+        serde_json::from_slice(&bytes).map_err(|_| "模型列表响应格式不兼容。".to_string())?;
+    let models = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "模型列表响应缺少 data 字段。".to_string())?;
+    let model_found = models
+        .iter()
+        .any(|item| item.get("id").and_then(Value::as_str) == Some(model));
+
+    Ok(ApiConnectionTestResult {
+        model_count: models.len(),
+        model_found,
+    })
+}
+
+#[tauri::command]
+async fn save_api_connection_profile(
+    params: SaveApiConnectionParams,
+) -> Result<StoredCodexRegistry, String> {
+    let (params, generated_profile_id) = normalize_api_connection_params(params)?;
+    let test_result =
+        test_api_connection_values(&params.base_url, &params.model, &params.api_key).await?;
+    if !test_result.model_found {
+        return Err(format!(
+            "连接正常并读取到 {} 个模型，但没有找到目标模型 {}。",
+            test_result.model_count, params.model
+        ));
+    }
+    let mut registry = read_registry()?;
+    let existing_index = if let Some(profile_id) = params.profile_id.as_deref() {
+        let index = registry
+            .accounts
+            .iter()
+            .position(|account| account.account_key == profile_id)
+            .ok_or_else(|| "API 连接不存在。".to_string())?;
+        if !is_api_connection(&registry.accounts[index]) {
+            return Err("只能用此入口编辑 API 连接。".to_string());
+        }
+        Some(index)
+    } else {
+        registry.accounts.iter().position(|account| {
+            is_api_connection(account)
+                && account.base_url.as_deref() == Some(params.base_url.as_str())
+                && account.workspace_id.as_deref() == params.workspace_id.as_deref()
+        })
+    };
+    let account_key = existing_index
+        .map(|index| registry.accounts[index].account_key.clone())
+        .unwrap_or(generated_profile_id);
+    let secret_id = existing_index
+        .and_then(|index| registry.accounts[index].secret_id.clone())
+        .unwrap_or_else(|| account_key.clone());
+    let provider_id = existing_index
+        .and_then(|index| registry.accounts[index].provider_id.clone())
+        .unwrap_or_else(|| format!("{API_PROVIDER_PREFIX}{}", &stable_hash(&account_key)[..12]));
+    let previous_secret = read_api_secret(&secret_id).ok();
+    store_api_secret(&secret_id, &params.api_key)?;
+
+    let key_suffix = params
+        .api_key
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    let previous = existing_index.map(|index| registry.accounts[index].clone());
+    let now = now_unix_seconds();
+    let account = StoredCodexAccount {
+        account_key: account_key.clone(),
+        alias: Some(params.label),
+        email: Some("API Key".to_string()),
+        plan: Some("api".to_string()),
+        auth_mode: Some("apikey".to_string()),
+        connection_kind: Some("api".to_string()),
+        provider_id: Some(provider_id),
+        base_url: Some(params.base_url),
+        model: Some(params.model),
+        workspace_name: params.workspace_name,
+        workspace_id: params.workspace_id,
+        key_hint: Some(format!("...{key_suffix}")),
+        secret_id: Some(secret_id.clone()),
+        created_at: previous
+            .as_ref()
+            .and_then(|account| account.created_at)
+            .or(Some(now)),
+        last_used_at: previous.as_ref().and_then(|account| account.last_used_at),
+        invalid_at: None,
+        invalid_reason: None,
+        ..StoredCodexAccount::default()
+    };
+    upsert_account(&mut registry, account);
+    registry.schema_version = Some(registry.schema_version.unwrap_or(5).max(5));
+
+    if let Err(error) = write_registry(&registry) {
+        let _ = match previous_secret {
+            Some(secret) => store_api_secret(&secret_id, &secret),
+            None => delete_api_secret(&secret_id),
+        };
+        return Err(error);
+    }
+
+    Ok(registry)
+}
+
+#[tauri::command]
+async fn test_api_connection_profile(
+    account_key: String,
+) -> Result<ApiConnectionTestResult, String> {
+    let registry = read_registry()?;
+    let account = registry
+        .accounts
+        .iter()
+        .find(|account| account.account_key == account_key && is_api_connection(account))
+        .ok_or_else(|| "API 连接不存在。".to_string())?;
+    let secret_id = account
+        .secret_id
+        .as_deref()
+        .ok_or_else(|| "API 连接缺少凭据引用。".to_string())?;
+    let api_key = read_api_secret(secret_id)?;
+    let base_url = account
+        .base_url
+        .as_deref()
+        .ok_or_else(|| "API 连接缺少 Base URL。".to_string())?;
+    let model = account.model.as_deref().unwrap_or_default();
+    test_api_connection_values(base_url, model, &api_key).await
 }
 
 fn configure_file_auth_credentials_store(existing_content: &str) -> Result<(String, bool), String> {
@@ -998,6 +1530,21 @@ fn save_current_codex_account(
     let mut registry = read_registry()?;
     registry.schema_version = Some(registry.schema_version.unwrap_or(4).max(4));
 
+    if let Some(active_index) = registry
+        .active_account_key
+        .as_deref()
+        .and_then(|active_key| {
+            registry
+                .accounts
+                .iter()
+                .position(|account| account.account_key == active_key && is_api_connection(account))
+        })
+    {
+        registry.accounts[active_index].last_used_at = Some(now_unix_seconds());
+        write_registry(&registry)?;
+        return Ok(registry);
+    }
+
     let auth_path = active_auth_path()?;
     let auth = read_auth_file(&auth_path)?;
     let account =
@@ -1018,6 +1565,14 @@ fn sync_active_account_snapshot(registry: &mut StoredCodexRegistry) -> Result<()
     let Some(active_account_key) = registry.active_account_key.clone() else {
         return Ok(());
     };
+    if registry
+        .accounts
+        .iter()
+        .find(|account| account.account_key == active_account_key)
+        .is_some_and(is_api_connection)
+    {
+        return Ok(());
+    }
     let auth_path = active_auth_path()?;
     if !auth_path.exists() {
         return Ok(());
@@ -1045,33 +1600,106 @@ fn sync_active_account_snapshot(registry: &mut StoredCodexRegistry) -> Result<()
 #[tauri::command]
 fn switch_local_codex_account(account_key: String) -> Result<AccountSwitchResult, String> {
     let mut registry = read_registry()?;
+    let previous_registry = registry.clone();
     let account_index = registry
         .accounts
         .iter()
         .position(|account| account.account_key == account_key)
         .ok_or_else(|| "Account is not saved in the local registry.".to_string())?;
-    let account_path = account_auth_path(&account_key)?;
-
-    if !account_path.exists() {
-        return Err(format!(
-            "Saved auth snapshot is missing: {}",
-            account_path.display()
-        ));
-    }
-
-    // Persist any refresh-token rotation before replacing the active auth file.
+    let target_account = registry.accounts[account_index].clone();
+    let current_is_api = active_account_is_api(&registry);
     sync_active_account_snapshot(&mut registry)?;
-    let auth = read_auth_file(&account_path)?;
-    let backup_path = backup_active_auth()?;
-    write_json_file(&active_auth_path()?, &auth)?;
+
+    let auth_path = active_auth_path()?;
+    let config_path = codex_config_path()?;
+    let previous_auth = fs::read(&auth_path).ok();
+    let previous_config = fs::read(&config_path).ok();
+    let backup_path = backup_connection_state(current_is_api)?;
+    let target_catalog_path = is_api_connection(&target_account)
+        .then(|| api_model_catalog_path(&target_account))
+        .transpose()?;
+    let previous_target_catalog = target_catalog_path
+        .as_ref()
+        .and_then(|path| fs::read(path).ok());
+
+    let (next_auth, next_config) = if is_api_connection(&target_account) {
+        let secret_id = target_account
+            .secret_id
+            .as_deref()
+            .ok_or_else(|| "API 连接缺少凭据引用。".to_string())?;
+        let api_key = read_api_secret(secret_id)?;
+        let baseline_path = chatgpt_config_snapshot_path()?;
+        if !current_is_api {
+            write_private_file(
+                &baseline_path,
+                previous_config.as_deref().unwrap_or_default(),
+            )?;
+        }
+        let baseline = fs::read_to_string(&baseline_path)
+            .map_err(|_| "找不到 ChatGPT 配置快照，已停止切换。".to_string())?;
+        let catalog_path = write_api_model_catalog(&target_account)?;
+        let config = configure_api_provider(&baseline, &target_account, &catalog_path, &api_key)?;
+        let auth = chatgpt_auth_for_api_switch(&registry, previous_auth.as_deref())?;
+        (auth, config.into_bytes())
+    } else {
+        let account_path = account_auth_path(&account_key)?;
+        if !account_path.exists() {
+            return Err(format!(
+                "Saved auth snapshot is missing: {}",
+                account_path.display()
+            ));
+        }
+        let auth = fs::read(&account_path)
+            .map_err(|error| format!("Unable to read {}: {error}", account_path.display()))?;
+        let config = if current_is_api {
+            fs::read(chatgpt_config_snapshot_path()?)
+                .map_err(|_| "找不到 ChatGPT 配置快照，已停止切换。".to_string())?
+        } else {
+            previous_config.clone().unwrap_or_default()
+        };
+        (auth, config)
+    };
+
+    if let Err(error) = write_private_file(&config_path, &next_config)
+        .and_then(|_| write_private_file(&auth_path, &next_auth))
+    {
+        let _ = restore_file(&config_path, previous_config.as_deref());
+        let _ = restore_file(&auth_path, previous_auth.as_deref());
+        if let Some(catalog_path) = target_catalog_path.as_deref() {
+            let _ = restore_file(catalog_path, previous_target_catalog.as_deref());
+        }
+        return Err(error);
+    }
 
     registry.active_account_key = Some(account_key.clone());
     registry.active_account_activated_at_ms = Some(now_unix_millis());
     registry.accounts[account_index].last_used_at = Some(now_unix_seconds());
-    write_registry(&registry)?;
+    if let Err(error) = write_registry(&registry) {
+        let config_rollback = restore_file(&config_path, previous_config.as_deref()).err();
+        let auth_rollback = restore_file(&auth_path, previous_auth.as_deref()).err();
+        let catalog_rollback = target_catalog_path.as_deref().and_then(|catalog_path| {
+            restore_file(catalog_path, previous_target_catalog.as_deref()).err()
+        });
+        let registry_rollback = write_registry(&previous_registry).err();
+        return Err(format!(
+            "{error}{}{}{}{}",
+            config_rollback
+                .map(|error| format!("；配置回滚失败：{error}"))
+                .unwrap_or_default(),
+            auth_rollback
+                .map(|error| format!("；认证回滚失败：{error}"))
+                .unwrap_or_default(),
+            catalog_rollback
+                .map(|error| format!("；模型目录回滚失败：{error}"))
+                .unwrap_or_default(),
+            registry_rollback
+                .map(|error| format!("；账号列表回滚失败：{error}"))
+                .unwrap_or_default(),
+        ));
+    }
 
     Ok(AccountSwitchResult {
-        backup_path: backup_path.map(|path| path.display().to_string()),
+        backup_path: Some(backup_path.display().to_string()),
         registry,
     })
 }
@@ -1323,6 +1951,8 @@ pub fn run() {
             mark_local_codex_account_invalid,
             clear_local_codex_account_invalid,
             delete_local_codex_account,
+            save_api_connection_profile,
+            test_api_connection_profile,
             ensure_file_auth_credentials_store,
             save_current_codex_account,
             switch_local_codex_account,
@@ -1340,11 +1970,14 @@ mod tests {
     #[cfg(target_os = "macos")]
     use super::macos_app_bundle_from_executable;
     use super::{
-        configure_file_auth_credentials_store, parse_reset_credits, remove_inactive_account,
-        reset_credits_auth, set_account_invalid_state, StoredCodexAccount, StoredCodexRegistry,
+        build_api_model_catalog, configure_api_provider, configure_file_auth_credentials_store,
+        normalize_api_connection_params, parse_reset_credits, redact_api_provider_secrets,
+        remove_inactive_account, reset_credits_auth, set_account_invalid_state,
+        SaveApiConnectionParams, StoredCodexAccount, StoredCodexRegistry,
     };
+    use std::path::Path;
     #[cfg(target_os = "macos")]
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     #[test]
     fn adds_file_auth_store_without_removing_existing_config() {
@@ -1376,6 +2009,91 @@ mod tests {
 
         assert!(changed);
         assert_eq!(updated, "cli_auth_credentials_store = \"file\"\n");
+    }
+
+    #[test]
+    fn configures_api_provider_with_isolated_bearer_token() {
+        let account = StoredCodexAccount {
+            account_key: "api-profile::test".to_string(),
+            alias: Some("DeepSeek API".to_string()),
+            connection_kind: Some("api".to_string()),
+            provider_id: Some("status_floater_api_test".to_string()),
+            base_url: Some("https://example.com/compatible-mode/v1".to_string()),
+            model: Some("deepseek-v4.1-flash".to_string()),
+            ..StoredCodexAccount::default()
+        };
+        let configured = configure_api_provider(
+            "model = \"gpt-5\"\n",
+            &account,
+            Path::new("/tmp/status-floater-api.json"),
+            "test-bearer-token",
+        )
+        .expect("provider config should update");
+
+        assert!(configured.contains("model = \"deepseek-v4.1-flash\""));
+        assert!(configured.contains("model_provider = \"status_floater_api_test\""));
+        assert!(configured.contains("wire_api = \"responses\""));
+        assert!(configured.contains("requires_openai_auth = false"));
+        assert!(configured.contains("experimental_bearer_token = \"test-bearer-token\""));
+        assert!(configured.contains("model_catalog_json"));
+
+        let redacted = redact_api_provider_secrets(&configured).expect("config should redact");
+        assert!(!redacted.contains("test-bearer-token"));
+        assert!(!redacted.contains("experimental_bearer_token"));
+    }
+
+    #[test]
+    fn builds_a_codex_compatible_api_model_catalog() {
+        let account = StoredCodexAccount {
+            account_key: "api-profile::test".to_string(),
+            alias: Some("DeepSeek API".to_string()),
+            connection_kind: Some("api".to_string()),
+            provider_id: Some("status_floater_api_test".to_string()),
+            model: Some("deepseek-v4.1-flash".to_string()),
+            ..StoredCodexAccount::default()
+        };
+        let catalog = build_api_model_catalog(&account).expect("catalog should build");
+        let model = &catalog["models"][0];
+
+        assert_eq!(model["slug"], "deepseek-v4.1-flash");
+        assert_eq!(model["visibility"], "list");
+        assert_eq!(model["supports_parallel_tool_calls"], false);
+        assert!(model.get("base_instructions").is_some());
+        assert!(!catalog.to_string().contains("api_key"));
+    }
+
+    #[test]
+    fn normalizes_secure_api_connection_params() {
+        let (params, profile_id) = normalize_api_connection_params(SaveApiConnectionParams {
+            profile_id: None,
+            label: " DeepSeek ".to_string(),
+            api_key: "sk-test-value".to_string(),
+            base_url: "https://example.com/compatible-mode/v1/".to_string(),
+            model: "deepseek-v4.1-flash".to_string(),
+            workspace_name: Some(" Workspace ".to_string()),
+            workspace_id: Some(" workspace-1 ".to_string()),
+        })
+        .expect("params should normalize");
+
+        assert_eq!(params.label, "DeepSeek");
+        assert_eq!(params.base_url, "https://example.com/compatible-mode/v1");
+        assert_eq!(params.workspace_name.as_deref(), Some("Workspace"));
+        assert!(profile_id.starts_with("api-profile::"));
+    }
+
+    #[test]
+    fn rejects_insecure_api_base_url() {
+        let result = normalize_api_connection_params(SaveApiConnectionParams {
+            profile_id: None,
+            label: "DeepSeek".to_string(),
+            api_key: "sk-test-value".to_string(),
+            base_url: "http://example.com/v1".to_string(),
+            model: "deepseek-v4.1-flash".to_string(),
+            workspace_name: None,
+            workspace_id: None,
+        });
+
+        assert!(result.is_err());
     }
 
     #[test]

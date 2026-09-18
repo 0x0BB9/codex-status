@@ -20,11 +20,17 @@ import type { PlanType, ServerNotification } from "./generated";
 import type {
   Account,
   AccountLoginCompletedNotification,
+  ConfigReadParams,
+  ConfigReadResponse,
   GetAccountRateLimitsResponse,
   LoginAccountParams,
   LoginAccountResponse,
   RateLimitSnapshot,
   Thread,
+  ThreadListParams,
+  ThreadListResponse,
+  ThreadStartParams,
+  ThreadStartResponse,
 } from "./generated/v2";
 import { CodexAppServerClient, DEFAULT_CODEX_WS_URL } from "./lib/codex-app-server";
 import {
@@ -34,8 +40,11 @@ import {
   listLocalCodexAccounts,
   markLocalCodexAccountInvalid,
   restartCodexDesktopClient,
+  saveApiConnectionProfile,
   saveCurrentCodexAccount,
   switchLocalCodexAccount,
+  testApiConnectionProfile,
+  type SaveApiConnectionParams,
   type StoredCodexRegistry,
 } from "./lib/local-codex-accounts";
 import {
@@ -100,6 +109,7 @@ type AccountLoginFlow = {
   userCode?: string;
   verificationUrl?: string;
 };
+type ApiConnectionDraft = SaveApiConnectionParams;
 type DashboardClient = {
   cancelAccountLogin: (loginId: string) => Promise<unknown>;
   connect: (target: string) => Promise<unknown>;
@@ -107,12 +117,10 @@ type DashboardClient = {
   getAccount: (refreshToken?: boolean) => Promise<{ account: Account | null }>;
   getRateLimits: () => Promise<GetAccountRateLimitsResponse>;
   isConnected: () => boolean;
-  listThreads: (params: {
-    limit: number;
-    sortDirection: "desc";
-    sortKey: "updated_at";
-  }) => Promise<{ data: Thread[] }>;
+  listThreads: (params: ThreadListParams) => Promise<ThreadListResponse>;
+  readConfig: (params?: ConfigReadParams) => Promise<ConfigReadResponse>;
   startAccountLogin: (params: LoginAccountParams) => Promise<LoginAccountResponse>;
+  startThread: (params: ThreadStartParams) => Promise<ThreadStartResponse>;
 };
 
 const MAX_LOG_LINES = 6;
@@ -123,12 +131,20 @@ const RESTART_CODEX_CLIENT_AFTER_SWITCH_KEY =
 const APP_THEME_STORAGE_KEY = "codex-status-floater.theme";
 const LAST_RUN_APP_VERSION_KEY = "codex-status-floater.lastRunAppVersion";
 const PENDING_APP_UPDATE_KEY = "codex-status-floater.pendingAppUpdate";
-const CURRENT_RELEASE_VERSION = "0.1.14";
+const CURRENT_RELEASE_VERSION = "0.1.16";
 const CURRENT_RELEASE_NOTES = [
-  "更新完成后显示一次升级结果和本次更新内容。",
-  "账号切换验证失败后会标记为需要重新登录。",
-  "支持重新登录失效账号，并安全删除非当前账号。",
+  "修复第三方 API 模型被错误发送到 OpenAI 接口的问题。",
+  "切换 API 时自动创建并打开 provider 正确的独立新任务。",
 ].join("\n");
+const EMPTY_API_CONNECTION_DRAFT: ApiConnectionDraft = {
+  profileId: null,
+  label: "DeepSeek API",
+  apiKey: "",
+  baseUrl: "",
+  model: "deepseek-v4.1-flash",
+  workspaceName: null,
+  workspaceId: null,
+};
 const APP_THEMES: Array<{
   id: AppTheme;
   label: string;
@@ -1024,6 +1040,99 @@ function getAuthAccountEmail(account: StoredCodexRegistry["accounts"][number]) {
   return title.toLocaleLowerCase() === email.toLocaleLowerCase() ? null : email;
 }
 
+function parseCsvRecords(content: string) {
+  const records: string[][] = [];
+  let record: string[] = [];
+  let field = "";
+  let quoted = false;
+
+  for (let index = 0; index < content.length; index += 1) {
+    const character = content[index];
+    if (quoted) {
+      if (character === '"' && content[index + 1] === '"') {
+        field += '"';
+        index += 1;
+      } else if (character === '"') {
+        quoted = false;
+      } else {
+        field += character;
+      }
+      continue;
+    }
+
+    if (character === '"') {
+      quoted = true;
+    } else if (character === ",") {
+      record.push(field);
+      field = "";
+    } else if (character === "\n") {
+      record.push(field.replace(/\r$/, ""));
+      if (record.some((value) => value.trim())) {
+        records.push(record);
+      }
+      record = [];
+      field = "";
+    } else {
+      field += character;
+    }
+  }
+
+  record.push(field.replace(/\r$/, ""));
+  if (record.some((value) => value.trim())) {
+    records.push(record);
+  }
+  return records;
+}
+
+function apiConnectionDraftFromCsv(content: string): ApiConnectionDraft {
+  const values = new Map(
+    parseCsvRecords(content).map((record) => [
+      record[0]?.replace(/^\uFEFF/, "").trim(),
+      record.slice(1).join(",").trim(),
+    ]),
+  );
+  const apiKey = values.get("apiKey") ?? "";
+  const baseUrl = values.get("openAiCompatible") ?? values.get("apiHost") ?? "";
+  if (!apiKey || !baseUrl) {
+    throw new Error("CSV 中缺少 apiKey 或 openAiCompatible 字段。");
+  }
+  const workspaceName = values.get("workspaceName") || null;
+
+  return {
+    ...EMPTY_API_CONNECTION_DRAFT,
+    label: workspaceName ? `${workspaceName} · DeepSeek` : "DeepSeek API",
+    apiKey,
+    baseUrl,
+    workspaceName,
+    workspaceId: values.get("workspaceId") || null,
+  };
+}
+
+function isApiConnectionAccount(
+  account: StoredCodexRegistry["accounts"][number] | null | undefined,
+) {
+  return account?.connection_kind === "api";
+}
+
+async function countAllInteractiveThreads(client: DashboardClient) {
+  let cursor: string | null = null;
+  let count = 0;
+
+  do {
+    const response = await client.listThreads({
+      cursor,
+      limit: 100,
+      modelProviders: [],
+      sortKey: "updated_at",
+      sortDirection: "desc",
+    });
+    count += response.data.length;
+    cursor = response.nextCursor;
+  } while (cursor && count < 10_000);
+
+  return count;
+}
+
 function normalizeBoardText(value: string | null | undefined) {
   return value?.trim() ?? "";
 }
@@ -1193,6 +1302,14 @@ function App() {
   const [isLaunching, setIsLaunching] = useState(false);
   const [isStartingAccountLogin, setIsStartingAccountLogin] = useState(false);
   const [isSavingAccount, setIsSavingAccount] = useState(false);
+  const [isApiConnectionFormOpen, setIsApiConnectionFormOpen] = useState(false);
+  const [apiConnectionDraft, setApiConnectionDraft] =
+    useState<ApiConnectionDraft>(EMPTY_API_CONNECTION_DRAFT);
+  const [isSavingApiConnection, setIsSavingApiConnection] = useState(false);
+  const [testingApiConnectionKey, setTestingApiConnectionKey] = useState<
+    string | null
+  >(null);
+  const [apiConnectionMessage, setApiConnectionMessage] = useState<string | null>(null);
   const [isRestartingCodexClient, setIsRestartingCodexClient] = useState(false);
   const [accountLoginFlow, setAccountLoginFlow] = useState<AccountLoginFlow | null>(
     null,
@@ -1324,6 +1441,14 @@ function App() {
       if (!isTauri) {
         return;
       }
+      const activeConnection = authRegistry?.accounts.find(
+        (account) => account.account_key === authRegistry.active_account_key,
+      );
+      if (isApiConnectionAccount(activeConnection)) {
+        setResetCredits(null);
+        setResetCreditsError(null);
+        return;
+      }
 
       const now = Date.now();
       const refreshDelay = resetCreditsError
@@ -1359,19 +1484,34 @@ function App() {
   );
 
   const refreshSnapshot = useEffectEvent(
-    async (options: { forceResetCredits?: boolean } = {}) => {
+    async (
+      options: { forceResetCredits?: boolean; apiConnection?: boolean } = {},
+    ) => {
     const client = clientRef.current;
     if (!client || !client.isConnected()) {
       return;
     }
 
-    void refreshResetCredits({ force: options.forceResetCredits });
+    const activeConnection = authRegistry?.accounts.find(
+      (account) => account.account_key === authRegistry.active_account_key,
+    );
+    const apiConnection =
+      options.apiConnection ?? isApiConnectionAccount(activeConnection);
+    if (apiConnection) {
+      setRateLimits([]);
+      setRateLimitError(null);
+      setResetCredits(null);
+      setResetCreditsError(null);
+    } else {
+      void refreshResetCredits({ force: options.forceResetCredits });
+    }
 
     const [accountResult, rateLimitResult, threadResult] = await Promise.allSettled([
       client.getAccount(),
-      client.getRateLimits(),
+      apiConnection ? Promise.resolve(null) : client.getRateLimits(),
       client.listThreads({
         limit: 40,
+        modelProviders: [],
         sortKey: "updated_at",
         sortDirection: "desc",
       }),
@@ -1382,10 +1522,10 @@ function App() {
         setAccount(accountResult.value.account);
       }
 
-      if (rateLimitResult.status === "fulfilled") {
+      if (rateLimitResult.status === "fulfilled" && rateLimitResult.value) {
         setRateLimits(normalizeRateLimits(rateLimitResult.value));
         setRateLimitError(null);
-      } else {
+      } else if (!apiConnection && rateLimitResult.status === "rejected") {
         setRateLimitError(
           getErrorMessage(rateLimitResult.reason, "无法读取 Codex 用量数据。"),
         );
@@ -2127,13 +2267,100 @@ function App() {
     }
   });
 
+  const handleApiCsvSelected = useEffectEvent(async (file: File) => {
+    setAuthError(null);
+    setApiConnectionMessage(null);
+    try {
+      const content = await file.text();
+      setApiConnectionDraft(apiConnectionDraftFromCsv(content));
+      setApiConnectionMessage("CSV 已读取，请确认模型后保存连接。API Key 不会显示在账号列表中。");
+    } catch (error) {
+      setAuthError(getErrorMessage(error, "读取 API CSV 失败。"));
+    }
+  });
+
+  const handleTestApiConnection = useEffectEvent(async (accountKey: string) => {
+    if (testingApiConnectionKey) {
+      return;
+    }
+    setTestingApiConnectionKey(accountKey);
+    setAuthError(null);
+    setApiConnectionMessage("正在读取模型列表，不会发起模型推理...");
+    try {
+      const result = await testApiConnectionProfile(accountKey);
+      setApiConnectionMessage(
+        result.modelFound
+          ? `连接正常，已读取 ${result.modelCount} 个模型，目标模型可用。`
+          : `连接正常，已读取 ${result.modelCount} 个模型，但没有找到目标模型，请检查模型 ID。`,
+      );
+    } catch (error) {
+      setAuthError(getErrorMessage(error, "API 连接测试失败。"));
+      setApiConnectionMessage(null);
+    } finally {
+      setTestingApiConnectionKey(null);
+    }
+  });
+
+  const handleSaveApiConnection = useEffectEvent(async () => {
+    if (isSavingApiConnection || switchingAccountKey) {
+      return;
+    }
+    setIsSavingApiConnection(true);
+    setAuthError(null);
+    setApiConnectionMessage("正在将 API Key 保存到系统凭据库...");
+    try {
+      const registry = await saveApiConnectionProfile(apiConnectionDraft);
+      setAuthRegistry(registry);
+      const normalizedBaseUrl = apiConnectionDraft.baseUrl.replace(/\/+$/, "");
+      const savedAccount = registry.accounts.find(
+        (account) =>
+          account.account_key === apiConnectionDraft.profileId ||
+          (isApiConnectionAccount(account) &&
+            account.base_url === normalizedBaseUrl &&
+            (account.workspace_id ?? null) ===
+              (apiConnectionDraft.workspaceId?.trim() || null)),
+      );
+      if (!savedAccount) {
+        throw new Error("连接已保存，但无法在本地账号列表中定位。请点击刷新账号。");
+      }
+      const shouldReloadActiveConnection =
+        registry.active_account_key === savedAccount.account_key;
+      setApiConnectionDraft({
+        ...EMPTY_API_CONNECTION_DRAFT,
+        label: savedAccount.alias ?? "DeepSeek API",
+      });
+      setIsApiConnectionFormOpen(false);
+      setLastEvent("api-connection/saved");
+      if (shouldReloadActiveConnection) {
+        setApiConnectionMessage("连接测试通过，正在重新加载当前 API 连接...");
+        await handleSwitchAccount(savedAccount.account_key);
+      } else {
+        setApiConnectionMessage("连接测试通过，API Key 已安全保存。");
+      }
+    } catch (error) {
+      setAuthError(getErrorMessage(error, "保存 API 连接失败。"));
+      setApiConnectionMessage(null);
+    } finally {
+      setIsSavingApiConnection(false);
+    }
+  });
+
   const handleSwitchAccount = useEffectEvent(async (accountKey: string) => {
     if (!isTauri || switchingAccountKey || isRestartingCodexClient) {
       return;
     }
 
     const previousAccountKey = authRegistry?.active_account_key ?? null;
+    const targetAccount = authRegistry?.accounts.find(
+      (account) => account.account_key === accountKey,
+    );
+    const previousAccount = authRegistry?.accounts.find(
+      (account) => account.account_key === previousAccountKey,
+    );
+    const targetIsApi = isApiConnectionAccount(targetAccount);
+    let previousThreadCount: number | null = null;
     let accountWasReplaced = false;
+    let apiThreadId: string | null = null;
     setSwitchingAccountKey(accountKey);
     setAuthError(null);
     setCodexClientRestartMessage(null);
@@ -2146,6 +2373,14 @@ function App() {
     resetCreditsLastAttemptAtRef.current = 0;
 
     try {
+      const currentClient = clientRef.current;
+      if (currentClient?.isConnected()) {
+        try {
+          previousThreadCount = await countAllInteractiveThreads(currentClient);
+        } catch {
+          previousThreadCount = null;
+        }
+      }
       await ensureFileAuthCredentialsStore();
       await disconnectClient("Reconnecting");
       const result = await switchLocalCodexAccount(accountKey);
@@ -2161,8 +2396,45 @@ function App() {
 
       // Do not rotate a saved refresh token just to verify a local account switch.
       const accountResult = await client.getAccount();
-      if (!accountResult.account) {
+      if (!targetIsApi && !accountResult.account) {
         throw new Error("Codex 未能读取目标账号登录状态，请重新登录并添加该账号。");
+      }
+      if (
+        !targetIsApi &&
+        accountResult.account?.type !== "chatgpt"
+      ) {
+        throw new Error("切换后的认证类型与目标连接不一致，已停止继续切换。");
+      }
+
+      if (targetIsApi) {
+        const providerId = targetAccount?.provider_id?.trim();
+        const model = targetAccount?.model?.trim();
+        if (!providerId || !model) {
+          throw new Error("API 连接缺少模型或 provider 配置，已停止继续切换。");
+        }
+
+        const configResult = await client.readConfig({
+          cwd: null,
+          includeLayers: false,
+        });
+        if (
+          configResult.config.model_provider !== providerId ||
+          configResult.config.model !== model
+        ) {
+          throw new Error("Codex 未加载目标 API provider，已停止继续切换。");
+        }
+
+        const apiThread = await client.startThread({
+          cwd: threads[0]?.cwd ?? null,
+          model,
+          modelProvider: providerId,
+          sessionStartSource: "clear",
+          threadSource: "user",
+        });
+        if (apiThread.modelProvider !== providerId) {
+          throw new Error("新任务仍绑定了错误的 provider，已停止继续切换。");
+        }
+        apiThreadId = apiThread.thread.id;
       }
 
       let verifiedRegistry = await saveCurrentCodexAccount();
@@ -2174,20 +2446,54 @@ function App() {
       setAuthRegistry(verifiedRegistry);
       setAccount(accountResult.account);
       setLastEvent("account/switch-verified");
-      setAccountLoginMessage("账号已切换，认证验证成功。");
-      await refreshSnapshot();
+      setAccountLoginMessage(
+        targetIsApi ? "API 连接已切换，provider 验证成功。" : "Plus 账号已切换，认证验证成功。",
+      );
+      await refreshSnapshot({ apiConnection: targetIsApi });
+
+      if (previousThreadCount !== null) {
+        const nextThreadCount = await countAllInteractiveThreads(client);
+        if (nextThreadCount < previousThreadCount) {
+          throw new Error(
+            `线程保护检查失败：切换前 ${previousThreadCount} 条，切换后只读取到 ${nextThreadCount} 条。`,
+          );
+        }
+        setApiConnectionMessage(
+          `线程保护检查通过：切换前 ${previousThreadCount} 条，切换后 ${nextThreadCount} 条未归档线程。`,
+        );
+      }
 
       if (restartCodexClientAfterSwitch) {
         const restarted = await handleRestartCodexClient();
         if (restarted) {
           setCodexClientRestartMessage(
-            "已重启官方客户端。浮窗账号已切换；新版 ChatGPT 客户端如使用独立会话，可能仍需在客户端内确认账号。",
+            targetIsApi
+              ? "已重启官方客户端，正在打开独立的 API 新任务。"
+              : "已重启官方客户端。浮窗账号已切换；新版 ChatGPT 客户端如使用独立会话，可能仍需在客户端内确认账号。",
           );
         }
       } else {
         setCodexClientRestartMessage(
-          "浮窗账号已完成切换；官方桌面客户端尚未重启。",
+          targetIsApi
+            ? "API 连接已切换，正在打开独立的新任务。"
+            : "浮窗账号已完成切换；官方桌面客户端尚未重启。",
         );
+      }
+
+      if (apiThreadId) {
+        try {
+          await openUrl(`codex://threads/${encodeURIComponent(apiThreadId)}`);
+          setCodexClientRestartMessage(
+            "已打开独立的 API 新任务；原 Plus 任务不会改绑 provider。",
+          );
+        } catch (openError) {
+          appendServerLog(
+            `Unable to open API thread: ${getErrorMessage(openError, "unknown error")}`,
+          );
+          setCodexClientRestartMessage(
+            "API 新任务已创建，但未能自动打开；可在官方客户端的任务列表中打开最新任务。",
+          );
+        }
       }
     } catch (error) {
       const switchError = formatLocalAccountError(error, "切换账号失败。");
@@ -2234,7 +2540,9 @@ function App() {
           setAccount(rollbackAccount.account);
           setLastEvent("account/switch-rolled-back");
           setAccountLoginMessage("目标账号验证失败，已自动恢复原账号。");
-          await refreshSnapshot();
+          await refreshSnapshot({
+            apiConnection: isApiConnectionAccount(previousAccount),
+          });
           rollbackSucceeded = true;
         } catch (rollbackFailure) {
           rollbackError = formatLocalAccountError(
@@ -2536,7 +2844,20 @@ function App() {
   );
   const authAccounts = authRegistry?.accounts ?? [];
   const activeAuthKey = authRegistry?.active_account_key ?? null;
-  const globalPrimaryUsage = getGlobalPrimaryUsage(rateLimits);
+  const activeAuthAccount = authAccounts.find(
+    (account) => account.account_key === activeAuthKey,
+  );
+  const activeConnectionIsApi = isApiConnectionAccount(activeAuthAccount);
+  const globalPrimaryUsage = activeConnectionIsApi
+    ? {
+        compactLabel: "API",
+        label: "API 独立计费",
+        poolLabel: activeAuthAccount?.model ?? null,
+        resetsAt: null,
+        tone: "safe" as const,
+        usedPercent: null,
+      }
+    : getGlobalPrimaryUsage(rateLimits);
   const threadGroups = (() => {
     if (groupBy === "none") {
       return [{ key: "all", label: "全部任务", threads: visibleThreads }];
@@ -2602,8 +2923,14 @@ function App() {
         >
           <span className="peek-grip" data-tauri-drag-region />
           <span className="peek-label">{globalPrimaryUsage.compactLabel}</span>
-          <strong>{formatPercent(globalPrimaryUsage.usedPercent)}</strong>
-          <small>{getCompactUsageToneText(globalPrimaryUsage.usedPercent)}</small>
+          <strong>
+            {activeConnectionIsApi ? "已连接" : formatPercent(globalPrimaryUsage.usedPercent)}
+          </strong>
+          <small>
+            {activeConnectionIsApi
+              ? activeAuthAccount?.model ?? "API 模型"
+              : getCompactUsageToneText(globalPrimaryUsage.usedPercent)}
+          </small>
         </button>
       ) : (
         <>
@@ -2645,7 +2972,11 @@ function App() {
               </button>
             ) : null}
           </p>
-          <h1>{describeAccount(account)}</h1>
+          <h1>
+            {activeConnectionIsApi && activeAuthAccount
+              ? `${getAuthAccountTitle(activeAuthAccount)} · ${activeAuthAccount.model ?? "API"}`
+              : describeAccount(account)}
+          </h1>
           <p className="subtitle">
             {lastSyncAt ? `${formatRelativeTime(lastSyncAt / 1000)}更新` : "等待数据"}
           </p>
@@ -2808,15 +3139,22 @@ function App() {
       <aside className={`quota-ribbon quota-ribbon-${globalPrimaryUsage.tone}`}>
         <div>
           <span>{globalPrimaryUsage.label}</span>
-          <strong>{formatPercent(globalPrimaryUsage.usedPercent)}</strong>
+          <strong>
+            {activeConnectionIsApi ? "按 API 用量计费" : formatPercent(globalPrimaryUsage.usedPercent)}
+          </strong>
         </div>
         <p>
-          {getUsageToneText(globalPrimaryUsage.usedPercent, globalPrimaryUsage.label)}
-          {globalPrimaryUsage.poolLabel ? ` · ${globalPrimaryUsage.poolLabel}` : " · 等待额度数据"}
-          {" · "}
-          {globalPrimaryUsage.resetsAt
-            ? `重置 ${formatResetTimeDetails(globalPrimaryUsage.resetsAt)}`
-            : "重置时间暂无"}
+          {activeConnectionIsApi
+            ? `${activeAuthAccount?.model ?? "API 模型"} · 不占用 Plus 五小时/一周额度`
+            : `${getUsageToneText(globalPrimaryUsage.usedPercent, globalPrimaryUsage.label)}${
+                globalPrimaryUsage.poolLabel
+                  ? ` · ${globalPrimaryUsage.poolLabel}`
+                  : " · 等待额度数据"
+              } · ${
+                globalPrimaryUsage.resetsAt
+                  ? `重置 ${formatResetTimeDetails(globalPrimaryUsage.resetsAt)}`
+                  : "重置时间暂无"
+              }`}
         </p>
       </aside>
 
@@ -2901,6 +3239,22 @@ function App() {
             </button>
             <button
               type="button"
+              onClick={() => {
+                setApiConnectionDraft(EMPTY_API_CONNECTION_DRAFT);
+                setApiConnectionMessage(null);
+                setIsApiConnectionFormOpen((current) => !current);
+              }}
+              disabled={
+                isSavingApiConnection ||
+                Boolean(switchingAccountKey) ||
+                Boolean(deletingAccountKey) ||
+                isRestartingCodexClient
+              }
+            >
+              添加 API 连接
+            </button>
+            <button
+              type="button"
               onClick={() => void loadAuthAccounts()}
               disabled={
                 isSavingAccount ||
@@ -2913,6 +3267,117 @@ function App() {
               刷新账号
             </button>
           </div>
+
+          {isApiConnectionFormOpen ? (
+            <div className="api-connection-form">
+              <div className="api-connection-heading">
+                <div>
+                  <strong>
+                    {apiConnectionDraft.profileId ? "更新 API 连接" : "添加 API 连接"}
+                  </strong>
+                  <small>支持导入阿里云 Model Studio 两列 CSV，也可以手动填写。</small>
+                </div>
+                <label className="file-import-button">
+                  导入 CSV
+                  <input
+                    accept=".csv,text/csv"
+                    type="file"
+                    onChange={(event) => {
+                      const file = event.currentTarget.files?.[0];
+                      event.currentTarget.value = "";
+                      if (file) {
+                        void handleApiCsvSelected(file);
+                      }
+                    }}
+                  />
+                </label>
+              </div>
+              <div className="api-connection-grid">
+                <label>
+                  <span>连接名称</span>
+                  <input
+                    value={apiConnectionDraft.label}
+                    onChange={(event) =>
+                      setApiConnectionDraft((current) => ({
+                        ...current,
+                        label: event.currentTarget.value,
+                      }))
+                    }
+                  />
+                </label>
+                <label>
+                  <span>模型 ID</span>
+                  <input
+                    value={apiConnectionDraft.model}
+                    onChange={(event) =>
+                      setApiConnectionDraft((current) => ({
+                        ...current,
+                        model: event.currentTarget.value,
+                      }))
+                    }
+                  />
+                </label>
+                <label className="api-field-wide">
+                  <span>Base URL</span>
+                  <input
+                    placeholder="https://.../compatible-mode/v1"
+                    value={apiConnectionDraft.baseUrl}
+                    onChange={(event) =>
+                      setApiConnectionDraft((current) => ({
+                        ...current,
+                        baseUrl: event.currentTarget.value,
+                      }))
+                    }
+                  />
+                </label>
+                <label className="api-field-wide">
+                  <span>API Key</span>
+                  <input
+                    autoComplete="off"
+                    placeholder={
+                      apiConnectionDraft.profileId
+                        ? "输入新 Key 以更新凭据"
+                        : "仅保存到系统凭据库"
+                    }
+                    type="password"
+                    value={apiConnectionDraft.apiKey}
+                    onChange={(event) =>
+                      setApiConnectionDraft((current) => ({
+                        ...current,
+                        apiKey: event.currentTarget.value,
+                      }))
+                    }
+                  />
+                </label>
+              </div>
+              <div className="action-row api-connection-actions">
+                <button
+                  className="primary"
+                  type="button"
+                  disabled={
+                    isSavingApiConnection ||
+                    !apiConnectionDraft.label.trim() ||
+                    !apiConnectionDraft.baseUrl.trim() ||
+                    !apiConnectionDraft.model.trim() ||
+                    !apiConnectionDraft.apiKey.trim()
+                  }
+                  onClick={() => void handleSaveApiConnection()}
+                >
+                  {isSavingApiConnection ? "保存中..." : "保存并测试"}
+                </button>
+                <button
+                  type="button"
+                  disabled={isSavingApiConnection}
+                  onClick={() => {
+                    setIsApiConnectionFormOpen(false);
+                    setApiConnectionDraft(EMPTY_API_CONNECTION_DRAFT);
+                  }}
+                >
+                  取消
+                </button>
+              </div>
+            </div>
+          ) : null}
 
           {accountLoginFlow ? (
             <div className="account-login-box">
@@ -3024,9 +3489,13 @@ function App() {
                         ) : null}
                       </h3>
                       <p>
-                        {formatAuthPlan(authAccount.plan)} ·{" "}
-                        {authAccount.auth_mode ?? "chatgpt"} · 最近使用{" "}
-                        {formatUnixTime(authAccount.last_used_at)}
+                        {isApiConnectionAccount(authAccount)
+                          ? `API 计费 · ${authAccount.model ?? "未设置模型"} · ${
+                              authAccount.key_hint ?? "Key 已保护"
+                            }`
+                          : `${formatAuthPlan(authAccount.plan)} · ${
+                              authAccount.auth_mode ?? "chatgpt"
+                            } · 最近使用 ${formatUnixTime(authAccount.last_used_at)}`}
                       </p>
                       {isInvalid ? (
                         <p
@@ -3062,6 +3531,42 @@ function App() {
                           {isSwitching ? "切换中..." : "切换"}
                         </button>
                       ) : null}
+                      {isApiConnectionAccount(authAccount) ? (
+                        <button
+                          type="button"
+                          className="chip"
+                          disabled={Boolean(testingApiConnectionKey) || isSavingApiConnection}
+                          onClick={() =>
+                            void handleTestApiConnection(authAccount.account_key)
+                          }
+                        >
+                          {testingApiConnectionKey === authAccount.account_key
+                            ? "测试中..."
+                            : "测试"}
+                        </button>
+                      ) : null}
+                      {isApiConnectionAccount(authAccount) ? (
+                        <button
+                          type="button"
+                          className="chip"
+                          disabled={isSavingApiConnection || Boolean(switchingAccountKey)}
+                          onClick={() => {
+                            setApiConnectionDraft({
+                              profileId: authAccount.account_key,
+                              label: getAuthAccountTitle(authAccount),
+                              apiKey: "",
+                              baseUrl: authAccount.base_url ?? "",
+                              model: authAccount.model ?? "deepseek-v4.1-flash",
+                              workspaceName: authAccount.workspace_name ?? null,
+                              workspaceId: authAccount.workspace_id ?? null,
+                            });
+                            setApiConnectionMessage(null);
+                            setIsApiConnectionFormOpen(true);
+                          }}
+                        >
+                          更新 Key
+                        </button>
+                      ) : null}
                       {isInvalid ? (
                         <button
                           type="button"
@@ -3075,10 +3580,23 @@ function App() {
                           }
                           onClick={() => {
                             setConfirmingDeleteAccountKey(null);
-                            void handleStartAccountLogin(authAccount.account_key);
+                            if (isApiConnectionAccount(authAccount)) {
+                              setApiConnectionDraft({
+                                profileId: authAccount.account_key,
+                                label: getAuthAccountTitle(authAccount),
+                                apiKey: "",
+                                baseUrl: authAccount.base_url ?? "",
+                                model: authAccount.model ?? "deepseek-v4.1-flash",
+                                workspaceName: authAccount.workspace_name ?? null,
+                                workspaceId: authAccount.workspace_id ?? null,
+                              });
+                              setIsApiConnectionFormOpen(true);
+                            } else {
+                              void handleStartAccountLogin(authAccount.account_key);
+                            }
                           }}
                         >
-                          重新登录
+                          {isApiConnectionAccount(authAccount) ? "更新 Key" : "重新登录"}
                         </button>
                       ) : null}
                       {!isActiveAccount && isConfirmingDelete ? (
@@ -3127,12 +3645,29 @@ function App() {
           )}
 
           <p className="hint">
-            安装包已内置官方 Codex 登录服务，无需安装 CLI。切换验证失败会保留原账号并标记目标账号；重新登录可刷新快照，删除只对非当前账号开放。
+            Plus 与 API 连接会切换模型 provider；失败时自动恢复原连接。API Key 长期保存在系统凭据库，激活期间只写入权限受限的 provider 配置，Plus 登录保持不变。
+          </p>
+          {apiConnectionMessage ? <p className="hint">{apiConnectionMessage}</p> : null}
+        </section>
+      ) : null}
+
+      {isConnected && activeConnectionIsApi ? (
+        <section className="panel api-billing-panel">
+          <div className="section-header">
+            <div>
+              <p className="section-eyebrow">用量</p>
+              <h2>API 独立计费</h2>
+            </div>
+            <span className="section-note">不使用 Plus 额度</span>
+          </div>
+          <p className="hint">
+            当前模型 {activeAuthAccount?.model ?? "未设置"}。五小时和一周额度仅适用于
+            ChatGPT 订阅；API 消耗请到对应服务商控制台查看。
           </p>
         </section>
       ) : null}
 
-      {isConnected ? (
+      {isConnected && !activeConnectionIsApi ? (
         <section className="panel">
         <div className="section-header">
           <div>

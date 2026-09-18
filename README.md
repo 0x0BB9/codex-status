@@ -14,6 +14,7 @@ Packaged builds include the official Codex native binary as a local sidecar, so 
 
 - account mode and plan summary
 - saved local Codex accounts with one-click switching
+- imported or manually configured Responses-compatible API connections, switchable alongside Plus accounts
 - invalid-account markers with re-login and safe deletion for inactive accounts
 - short-window and long-window usage, reset times, and available reset-credit expirations
 - recent threads sorted by latest activity
@@ -34,9 +35,13 @@ The app implements local account switching itself. It does not require `codex-au
 - The app automatically enables file-backed Codex credentials before adding, saving, or switching an account and backs up an existing config before changing it.
 - Clicking "登录添加账号" starts the official Codex app-server login flow, then saves the completed auth as a local snapshot.
 - Clicking "保存当前账号" stores the currently logged-in Codex auth as a local snapshot.
-- Clicking "切换" first saves the active account's latest tokens, replaces `auth.json`, then restarts app-server and verifies the existing login without forcing refresh-token rotation.
+- Switching to a Plus account first saves the active account's latest tokens, replaces `auth.json`, then restarts app-server and verifies the existing login without forcing refresh-token rotation.
 - Failed verification automatically restores the previous account instead of leaving Codex signed out.
 - Failed target accounts are marked for re-login. A successful official login clears the marker, while inactive accounts can be deleted after confirmation.
+- API keys are stored long-term in macOS Keychain or Windows Credential Manager; the registry stores only a last-four-character hint.
+- Activating an API connection preserves the Plus login, switches the model provider and generated model catalog, then opens a separate thread bound to that provider. Switching back restores the original Codex configuration.
+- While an API connection is active, its key is copied only into the user-readable provider configuration; connection backups redact that bearer token.
+- The app compares the all-provider unarchived thread count before and after switching, and restores the previous connection if the count drops.
 - The account panel can restart the official Codex desktop client on macOS or Windows after a verified switch. Newer ChatGPT desktop builds may keep a separate host session that still needs confirmation inside the official client.
 
 See [docs/account-switching.md](docs/account-switching.md) for the full file layout, switching flow, backups, compatibility notes, and limitations.

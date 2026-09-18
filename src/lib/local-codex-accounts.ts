@@ -11,6 +11,14 @@ export type StoredCodexAccount = {
   email?: string | null;
   invalid_at?: number | null;
   invalid_reason?: string | null;
+  connection_kind?: "chatgpt" | "api" | null;
+  provider_id?: string | null;
+  base_url?: string | null;
+  model?: string | null;
+  workspace_name?: string | null;
+  workspace_id?: string | null;
+  key_hint?: string | null;
+  secret_id?: string | null;
   last_used_at?: number | null;
   plan?: string | null;
 };
@@ -33,6 +41,21 @@ export type AuthStorageConfigResult = {
   backup_path?: string | null;
   changed: boolean;
   config_path: string;
+};
+
+export type SaveApiConnectionParams = {
+  profileId?: string | null;
+  label: string;
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+  workspaceName?: string | null;
+  workspaceId?: string | null;
+};
+
+export type ApiConnectionTestResult = {
+  modelCount: number;
+  modelFound: boolean;
 };
 
 export async function listLocalCodexAccounts() {
@@ -79,4 +102,14 @@ export async function deleteLocalCodexAccount(accountKey: string) {
 
 export async function restartCodexDesktopClient() {
   return invoke<void>("restart_codex_desktop_client");
+}
+
+export async function saveApiConnectionProfile(params: SaveApiConnectionParams) {
+  return invoke<StoredCodexRegistry>("save_api_connection_profile", { params });
+}
+
+export async function testApiConnectionProfile(accountKey: string) {
+  return invoke<ApiConnectionTestResult>("test_api_connection_profile", {
+    accountKey,
+  });
 }

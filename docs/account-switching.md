@@ -9,10 +9,16 @@
 ```text
 ~/.codex/
   auth.json
+  config.toml
   accounts/
     registry.json
     <base64url(account_key)>.auth.json
-    auth.json.bak.<timestamp>
+  status-floater/
+    chatgpt-config.toml
+    model-catalogs/
+      <provider_id>.json
+    connection-backups/
+      switch-<timestamp>/
 ```
 
 如果设置了 `CODEX_HOME`，并且该目录存在，工具会优先使用 `CODEX_HOME`。
@@ -24,7 +30,19 @@
 - `~/.codex/auth.json` 是当前 Codex CLI / app-server 会读取的认证文件。
 - `~/.codex/accounts/*.auth.json` 是保存下来的账号快照。
 - `~/.codex/accounts/registry.json` 是账号索引，记录当前激活账号和账号展示信息。
-- `~/.codex/accounts/auth.json.bak.<timestamp>` 是切换账号前自动生成的备份。
+- `~/.codex/status-floater/chatgpt-config.toml` 是进入 API 模式前的 Plus 配置快照。
+- `~/.codex/status-floater/model-catalogs/*.json` 是应用生成的自定义模型目录，不包含 API Key。
+- `~/.codex/status-floater/connection-backups/switch-*/` 是切换前的配置和账号索引备份；从 Plus 切换时还包含认证备份。
+
+## 添加 API 连接
+
+1. 点击“添加 API 连接”，选择两列 CSV 或手动填写连接名称、Base URL、模型 ID 和 API Key。
+2. CSV 只在当前窗口读取，不会复制进项目或账号目录。
+3. 应用把 API Key 保存到 macOS 钥匙串或 Windows 凭据管理器；`registry.json` 只记录连接参数和 Key 末四位。
+4. “保存并测试”只请求 `<Base URL>/models` 并确认模型 ID，不调用推理接口。
+5. 激活连接时，应用生成私有模型目录并同时设置 `model`、`model_provider` 和 `model_catalog_json`。
+
+API Key 长期只保存在系统凭据库。API 连接激活期间，工具会把 Key 临时写入自定义 provider 的 `experimental_bearer_token`，并把 `config.toml` 权限限制为仅当前用户可读；标准 `auth.json` 继续保留 Plus 登录。切回 Plus 后会恢复原配置，连接备份也会自动剔除 bearer token。
 
 ## 登录添加账号
 
@@ -57,12 +75,22 @@
 点击账号卡片里的“切换”后：
 
 1. 工具把当前 `~/.codex/auth.json` 回写到当前账号快照，保存 Codex 自动刷新后的最新 token。
-2. 工具把当前认证备份到 `accounts/auth.json.bak.<timestamp>`。
+2. 工具把当前配置和账号索引备份到 `status-floater/connection-backups/switch-<timestamp>/`；当前连接是 Plus 时同时备份认证。
 3. 工具用目标账号快照替换 `~/.codex/auth.json`，并更新 `registry.json`。
 4. 浮窗重启自己的 `codex app-server`，读取并验证目标账号登录状态，但不会仅为切换而强制轮换 refresh token。
 5. 验证成功后，再把 Codex 当前使用的认证回写到目标账号快照；Codex 在真正需要时仍会自动刷新 token。
 6. 如果验证失败，工具会自动切回并验证原账号，避免停留在未登录状态。
 7. 目标账号会标记为“需要重新登录”，记录失败时间和精简错误原因，但不会改写认证快照。
+
+## Plus 与 API 连接切换
+
+- 切到 API 连接时，工具从系统凭据库读取 Key，生成模型目录，并基于保存的 Plus 配置写入自定义 provider；Plus 的 `auth.json` 保持不变。
+- app-server 加载配置后，工具会核对 `model` 和 `model_provider`，再创建一个显式绑定该 provider 的独立新任务，并通过 `codex://threads/<id>` 请求官方客户端打开。
+- 切回 Plus 时，工具恢复原 `config.toml` 和目标 Plus 认证快照。
+- 浮窗使用 `modelProviders: []` 读取全部 provider 的线程，并在切换前后比较未归档线程数量；数量减少会触发回滚。
+- 工具不会改写 `state_5.sqlite` 或 rollout 中已有线程的 `model_provider`。Plus 线程继续使用 Plus；API 线程继续关联创建它的 API provider。
+- 不要在旧 Plus 任务里直接选择第三方模型；旧任务的 provider 仍是 `openai`。应使用切换时自动创建的新 API 任务。
+- 看板可以继续显示不同 provider 的历史线程。要继续运行某个 API 线程，应先切回创建该线程的 API 连接。
 
 ## 重新登录失效账号
 
@@ -72,6 +100,7 @@
 
 - 只有非当前账号提供删除入口，并需要二次确认。
 - 删除会同时移除 `registry.json` 中的账号记录和对应的 `accounts/*.auth.json` 快照。
+- 删除 API 连接会同时删除系统凭据库中的 Key 和本地模型目录。
 - 当前账号不能删除；需要先切换到另一个已验证账号。
 - 删除失败时工具会尝试恢复账号索引，避免列表与本地文件状态不一致。
 
@@ -100,5 +129,7 @@ macOS 会通过 bundle id `com.openai.codex` 请求官方客户端退出，等�
 - 发布安装包内置官方 Codex app-server，因此接收方不需要安装 Codex CLI。
 - 工具只管理本机文件，不跨设备同步账号。
 - 认证文件包含敏感 token，不要把 `~/.codex/accounts` 提交到 Git 或发给别人。
+- API 服务必须支持 HTTPS、Bearer API Key、`GET /models` 和 OpenAI Responses 兼容请求；兼容程度仍取决于服务端实现。
+- 更新当前 API 连接的 Key 后，浮窗会重新启动自己的 app-server 以加载新凭据。
 - 重启官方 Codex 桌面客户端会关闭当前 Codex App 窗口；正在进行的客户端会话可能需要重新打开。
 - 编辑账号别名、导入外部 auth 文件还没有做成 UI。
