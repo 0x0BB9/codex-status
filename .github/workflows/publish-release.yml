@@ -3,10 +3,8 @@ name: Publish Release
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/publish-release.yml"
+    tags:
+      - "v*"
 
 permissions:
   contents: read

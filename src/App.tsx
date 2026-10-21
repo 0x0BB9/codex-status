@@ -13,6 +13,10 @@ import {
   PhysicalSize,
 } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
+import { invoke } from "@tauri-apps/api/core";
+import { ThreadHistory } from "./ThreadHistory";
+import { getErrorMessage } from "./lib/error-message";
+import { listThreadHistory, compareThreadHistory, describeHistoryChanges, type HistoryClient, type HistoryEntry } from "./lib/thread-history";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
@@ -37,14 +41,17 @@ import {
   clearLocalCodexAccountInvalid,
   deleteLocalCodexAccount,
   ensureFileAuthCredentialsStore,
+  ensureHistoryProviderDefinitions,
   listLocalCodexAccounts,
   markLocalCodexAccountInvalid,
+  readDesktopBridgeStatus,
   restartCodexDesktopClient,
   saveApiConnectionProfile,
   saveCurrentCodexAccount,
   switchLocalCodexAccount,
   testApiConnectionProfile,
   type SaveApiConnectionParams,
+  type DesktopBridgeStatus,
   type StoredCodexRegistry,
 } from "./lib/local-codex-accounts";
 import {
@@ -110,7 +117,7 @@ type AccountLoginFlow = {
   verificationUrl?: string;
 };
 type ApiConnectionDraft = SaveApiConnectionParams;
-type DashboardClient = {
+type DashboardClient = HistoryClient & {
   cancelAccountLogin: (loginId: string) => Promise<unknown>;
   connect: (target: string) => Promise<unknown>;
   disconnect: (reason?: string) => void;
@@ -123,19 +130,47 @@ type DashboardClient = {
   startThread: (params: ThreadStartParams) => Promise<ThreadStartResponse>;
 };
 
+class HistoryVerificationError extends Error {}
+
+const HISTORY_NOTICE_STORAGE_KEY = "codex-status-floater.historyNotice";
+
 const MAX_LOG_LINES = 6;
 const RESET_CREDITS_REFRESH_MS = 5 * 60_000;
 const RESET_CREDITS_RETRY_MS = 60_000;
+const BRIDGE_STATUS_REFRESH_MS = 3_000;
 const RESTART_CODEX_CLIENT_AFTER_SWITCH_KEY =
   "codex-status-floater.restartCodexClientAfterSwitch";
 const APP_THEME_STORAGE_KEY = "codex-status-floater.theme";
 const LAST_RUN_APP_VERSION_KEY = "codex-status-floater.lastRunAppVersion";
 const PENDING_APP_UPDATE_KEY = "codex-status-floater.pendingAppUpdate";
-const CURRENT_RELEASE_VERSION = "0.1.16";
+const CURRENT_RELEASE_VERSION = "0.1.18";
 const CURRENT_RELEASE_NOTES = [
-  "修复第三方 API 模型被错误发送到 OpenAI 接口的问题。",
-  "切换 API 时自动创建并打开 provider 正确的独立新任务。",
+  "跨服务商续聊只重放可见问答，修复第三方调用 ID导致的 GPT 请求错误。",
+  "悬浮工具显示官方客户端的处理、重试、失败和完成状态。",
 ].join("\n");
+
+function normalizeBridgeStatusMessage(status: DesktopBridgeStatus) {
+  if (/high demand|429|too many requests/i.test(status.message)) {
+    return "GPT 服务端当前负载较高，Codex 正在等待后重试。";
+  }
+  if (/expected an id that begins with ['\"]fc_/i.test(status.message)) {
+    return "旧聊天包含第三方工具调用格式，当前版本会在下次重新打开聊天时自动转换。";
+  }
+  if (/array too long/i.test(status.message)) {
+    return "旧聊天包含不兼容的隐藏推理数据，当前版本会在下次重新打开聊天时自动转换。";
+  }
+  return status.message;
+}
+
+function bridgeStatusIsVisible(status: DesktopBridgeStatus, now = Date.now()) {
+  const age = now - status.updatedAtMs;
+  const ttl = status.state === "completed"
+    ? 60_000
+    : status.state === "failed"
+      ? 15 * 60_000
+      : 30 * 60_000;
+  return age >= 0 && age <= ttl;
+}
 const EMPTY_API_CONNECTION_DRAFT: ApiConnectionDraft = {
   profileId: null,
   label: "DeepSeek API",
@@ -926,10 +961,6 @@ function formatConnectionError(message: string | null) {
   }
 }
 
-function getErrorMessage(error: unknown, fallback: string) {
-  return error instanceof Error ? error.message : fallback;
-}
-
 function formatLocalAccountError(error: unknown, fallback: string) {
   const message = getErrorMessage(error, fallback);
   const normalizedMessage = message.toLowerCase();
@@ -1114,25 +1145,6 @@ function isApiConnectionAccount(
   return account?.connection_kind === "api";
 }
 
-async function countAllInteractiveThreads(client: DashboardClient) {
-  let cursor: string | null = null;
-  let count = 0;
-
-  do {
-    const response = await client.listThreads({
-      cursor,
-      limit: 100,
-      modelProviders: [],
-      sortKey: "updated_at",
-      sortDirection: "desc",
-    });
-    count += response.data.length;
-    cursor = response.nextCursor;
-  } while (cursor && count < 10_000);
-
-  return count;
-}
-
 function normalizeBoardText(value: string | null | undefined) {
   return value?.trim() ?? "";
 }
@@ -1302,6 +1314,20 @@ function App() {
   const [isLaunching, setIsLaunching] = useState(false);
   const [isStartingAccountLogin, setIsStartingAccountLogin] = useState(false);
   const [isSavingAccount, setIsSavingAccount] = useState(false);
+  const [isHistoryBusy, setIsHistoryBusy] = useState(false);
+  const [desktopBridgeStatus, setDesktopBridgeStatus] =
+    useState<DesktopBridgeStatus | null>(null);
+  const [historyNotice, setHistoryNotice] = useState<string | null>(() => {
+    try { return window.localStorage.getItem(HISTORY_NOTICE_STORAGE_KEY); }
+    catch { return null; }
+  });
+  const [historyRecoveryOpen, setHistoryRecoveryOpen] = useState(false);
+  useEffect(() => {
+    try {
+      if (historyNotice) window.localStorage.setItem(HISTORY_NOTICE_STORAGE_KEY, historyNotice);
+      else window.localStorage.removeItem(HISTORY_NOTICE_STORAGE_KEY);
+    } catch { /* Keep the in-memory notice when storage is unavailable. */ }
+  }, [historyNotice]);
   const [isApiConnectionFormOpen, setIsApiConnectionFormOpen] = useState(false);
   const [apiConnectionDraft, setApiConnectionDraft] =
     useState<ApiConnectionDraft>(EMPTY_API_CONNECTION_DRAFT);
@@ -1557,7 +1583,9 @@ function App() {
 
     try {
       await restartCodexDesktopClient();
-      setCodexClientRestartMessage("Codex 客户端已重新启动。");
+      setCodexClientRestartMessage(authRegistry?.accounts.some(isApiConnectionAccount)
+        ? "客户端已重启，历史兼容连接已启动；重新打开的旧聊天将使用当前连接和配置模型。"
+        : "Codex 客户端已重新启动。");
       setLastEvent("codex-client/restarted");
       return true;
     } catch (error) {
@@ -1758,6 +1786,7 @@ function App() {
 
       try {
         setIsLaunching(isTauri && Boolean(options?.launchIfNeeded));
+        if (isTauri) await ensureHistoryProviderDefinitions();
         await attemptConnection();
 
         setConnectionState("connected");
@@ -2123,6 +2152,8 @@ function App() {
   const handleStartAccountLogin = useEffectEvent(async (targetAccountKey?: string) => {
     if (
       !isTauri ||
+      isHistoryBusy ||
+      switchingAccountKey ||
       isStartingAccountLogin ||
       accountLoginFlow ||
       deletingAccountKey ||
@@ -2346,7 +2377,7 @@ function App() {
   });
 
   const handleSwitchAccount = useEffectEvent(async (accountKey: string) => {
-    if (!isTauri || switchingAccountKey || isRestartingCodexClient) {
+    if (!isTauri || switchingAccountKey || isRestartingCodexClient || isHistoryBusy) {
       return;
     }
 
@@ -2358,10 +2389,12 @@ function App() {
       (account) => account.account_key === previousAccountKey,
     );
     const targetIsApi = isApiConnectionAccount(targetAccount);
-    let previousThreadCount: number | null = null;
+    let previousHistory: HistoryEntry[] = [];
     let accountWasReplaced = false;
     let apiThreadId: string | null = null;
     setSwitchingAccountKey(accountKey);
+    setHistoryRecoveryOpen(false);
+    setApiConnectionMessage(null);
     setAuthError(null);
     setCodexClientRestartMessage(null);
     setAccountLoginMessage("正在切换并验证账号...");
@@ -2374,12 +2407,21 @@ function App() {
 
     try {
       const currentClient = clientRef.current;
-      if (currentClient?.isConnected()) {
-        try {
-          previousThreadCount = await countAllInteractiveThreads(currentClient);
-        } catch {
-          previousThreadCount = null;
-        }
+      if (!currentClient?.isConnected()) throw new Error("请先重新连接，完成聊天备份后再切换。");
+      setAccountLoginMessage("正在读取全部服务商历史并备份聊天文件...");
+      let backup: { directory: string; copied: number; skipped: string[] };
+      try {
+        previousHistory = await listThreadHistory(currentClient);
+        backup = await invoke<typeof backup>("backup_thread_history", {
+          entries: previousHistory.map(({ thread, archived }) => ({ id: thread.id, path: thread.path, provider: thread.modelProvider, archived })),
+        });
+      } catch (error) {
+        const message = `切换前的聊天保护未完成，已停止切换：${getErrorMessage(error, "历史查询或备份失败。")}`;
+        setHistoryNotice(message);
+        throw new HistoryVerificationError(message);
+      }
+      if (backup.skipped.length) {
+        setHistoryNotice(`${backup.skipped.length} 条旧记录没有可读取的聊天文件，已跳过并保存索引，其余 ${backup.copied} 条已备份。可继续切换。备份：${backup.directory}`);
       }
       await ensureFileAuthCredentialsStore();
       await disconnectClient("Reconnecting");
@@ -2451,32 +2493,40 @@ function App() {
       );
       await refreshSnapshot({ apiConnection: targetIsApi });
 
-      if (previousThreadCount !== null) {
-        const nextThreadCount = await countAllInteractiveThreads(client);
-        if (nextThreadCount < previousThreadCount) {
-          throw new Error(
-            `线程保护检查失败：切换前 ${previousThreadCount} 条，切换后只读取到 ${nextThreadCount} 条。`,
-          );
+      // A visibility change is not an authentication failure: report it without marking the account invalid.
+      const verifyHistory = async (phase: string, stopOnMissing = false) => {
+        try {
+          const after = await listThreadHistory(client);
+          const changes = compareThreadHistory(previousHistory, after);
+          if (changes.missing.length || changes.newlyArchived.length || changes.providerChanged.length) {
+            setHistoryNotice(`${phase}：${describeHistoryChanges(previousHistory, after)} 备份：${backup.directory}`);
+          }
+          if (stopOnMissing && (changes.missing.length || changes.providerChanged.length)) {
+            throw new HistoryVerificationError(`历史检查未通过，已停止继续切换：${describeHistoryChanges(previousHistory, after)} 备份：${backup.directory}`);
+          }
+        } catch (error) {
+          setHistoryNotice(error instanceof HistoryVerificationError ? error.message : `${phase}历史复查未完成，可通过“找回记录”检查。切换前备份：${backup.directory}`);
+          if (stopOnMissing) throw error instanceof HistoryVerificationError ? error : new HistoryVerificationError(`历史复查失败，已停止继续切换。备份：${backup.directory}`);
         }
-        setApiConnectionMessage(
-          `线程保护检查通过：切换前 ${previousThreadCount} 条，切换后 ${nextThreadCount} 条未归档线程。`,
-        );
-      }
+      };
+      await verifyHistory("切换后", true);
 
       if (restartCodexClientAfterSwitch) {
         const restarted = await handleRestartCodexClient();
         if (restarted) {
+          await new Promise((resolve) => window.setTimeout(resolve, 2000));
+          await verifyHistory("客户端重启后");
           setCodexClientRestartMessage(
             targetIsApi
-              ? "已重启官方客户端，正在打开独立的 API 新任务。"
-              : "已重启官方客户端。浮窗账号已切换；新版 ChatGPT 客户端如使用独立会话，可能仍需在客户端内确认账号。",
+              ? "已重启并启动历史兼容连接，旧聊天将使用当前 API 连接和配置模型。"
+              : "已重启官方客户端，重新打开的旧聊天将使用当前 GPT 连接和配置模型；宿主独立登录可能仍需确认。",
           );
         }
       } else {
         setCodexClientRestartMessage(
           targetIsApi
-            ? "API 连接已切换，正在打开独立的新任务。"
-            : "浮窗账号已完成切换；官方桌面客户端尚未重启。",
+            ? "API 连接已切换；请点击“立即重启 Codex 客户端”，再继续旧聊天。"
+            : "浮窗账号已切换；请点击“立即重启 Codex 客户端”，再继续旧聊天。",
         );
       }
 
@@ -2484,7 +2534,7 @@ function App() {
         try {
           await openUrl(`codex://threads/${encodeURIComponent(apiThreadId)}`);
           setCodexClientRestartMessage(
-            "已打开独立的 API 新任务；原 Plus 任务不会改绑 provider。",
+            "已打开 API 新任务。旧聊天会在客户端重启并重新打开后使用当前连接，不改写历史正文。",
           );
         } catch (openError) {
           appendServerLog(
@@ -2500,15 +2550,15 @@ function App() {
       let rollbackError: string | null = null;
       let rollbackSucceeded = false;
       const shouldMarkInvalid =
-        accountWasReplaced ||
-        /auth snapshot is missing|认证快照不存在/i.test(switchError);
+        !(error instanceof HistoryVerificationError) && (accountWasReplaced ||
+        /auth snapshot is missing|认证快照不存在/i.test(switchError));
 
       if (
         accountWasReplaced &&
         previousAccountKey &&
         previousAccountKey !== accountKey
       ) {
-        setAccountLoginMessage("目标账号验证失败，正在恢复原账号...");
+        setAccountLoginMessage("切换检查未通过，正在恢复原连接...");
 
         try {
           await disconnectClient("Reconnecting");
@@ -2539,7 +2589,7 @@ function App() {
           setAuthRegistry(restoredRegistry);
           setAccount(rollbackAccount.account);
           setLastEvent("account/switch-rolled-back");
-          setAccountLoginMessage("目标账号验证失败，已自动恢复原账号。");
+          setAccountLoginMessage("切换检查未通过，已自动恢复原连接。");
           await refreshSnapshot({
             apiConnection: isApiConnectionAccount(previousAccount),
           });
@@ -2663,6 +2713,38 @@ function App() {
 
     return () => {
       void disconnectClient();
+    };
+  }, [isTauri]);
+
+  useEffect(() => {
+    if (!isTauri) {
+      return undefined;
+    }
+
+    let disposed = false;
+    const refreshBridgeStatus = async () => {
+      try {
+        const status = await readDesktopBridgeStatus();
+        if (!disposed) {
+          setDesktopBridgeStatus(
+            status && bridgeStatusIsVisible(status) ? status : null,
+          );
+        }
+      } catch {
+        if (!disposed) {
+          setDesktopBridgeStatus(null);
+        }
+      }
+    };
+
+    void refreshBridgeStatus();
+    const interval = window.setInterval(
+      () => void refreshBridgeStatus(),
+      BRIDGE_STATUS_REFRESH_MS,
+    );
+    return () => {
+      disposed = true;
+      window.clearInterval(interval);
     };
   }, [isTauri]);
 
@@ -3158,6 +3240,29 @@ function App() {
         </p>
       </aside>
 
+      {desktopBridgeStatus ? (
+        <aside
+          className={`bridge-status bridge-status-${desktopBridgeStatus.state}`}
+          role={desktopBridgeStatus.state === "failed" ? "alert" : "status"}
+        >
+          <div>
+            <span>Codex 客户端</span>
+            <strong>
+              {desktopBridgeStatus.state === "preparing"
+                ? "正在准备旧聊天"
+                : desktopBridgeStatus.state === "working"
+                  ? "模型处理中"
+                  : desktopBridgeStatus.state === "retrying"
+                    ? `正在重试${desktopBridgeStatus.retryCount ? ` ${desktopBridgeStatus.retryCount}` : ""}`
+                    : desktopBridgeStatus.state === "completed"
+                      ? "处理完成"
+                      : "处理失败"}
+            </strong>
+          </div>
+          <p>{normalizeBridgeStatusMessage(desktopBridgeStatus)}</p>
+        </aside>
+      ) : null}
+
       <section className="panel connection-panel">
         <div className="action-row">
           <button
@@ -3521,6 +3626,7 @@ function App() {
                           className="chip"
                           disabled={
                             Boolean(switchingAccountKey) ||
+                            isHistoryBusy ||
                             Boolean(deletingAccountKey) ||
                             Boolean(accountLoginFlow) ||
                             isSavingAccount ||
@@ -3799,6 +3905,35 @@ function App() {
           </div>
         )}
         </section>
+      ) : null}
+
+      {historyNotice ? (
+        <section className="panel history-notice" role="alert">
+          <h2>聊天记录需要检查</h2>
+          <p className="error-text">{historyNotice}</p>
+          <div className="action-row">
+            <button type="button" disabled={!isConnected || Boolean(switchingAccountKey) || isHistoryBusy}
+              onClick={() => setHistoryRecoveryOpen(!historyRecoveryOpen)}>
+              {historyRecoveryOpen ? "收起找回工具" : "找回记录"}
+            </button>
+            <button type="button" disabled={Boolean(switchingAccountKey) || isHistoryBusy}
+              onClick={() => { setHistoryNotice(null); setHistoryRecoveryOpen(false); }}>已了解，关闭提示</button>
+          </div>
+          {!isConnected ? <p className="section-note">重新连接后可打开找回工具。</p> : null}
+        </section>
+      ) : null}
+
+      {historyNotice && historyRecoveryOpen && isConnected && clientRef.current ? (
+        <ThreadHistory
+          client={clientRef.current}
+          busy={Boolean(switchingAccountKey) || Boolean(accountLoginFlow) || isStartingAccountLogin || isRestartingCodexClient}
+          providerNames={Object.fromEntries([
+            ["openai", "OpenAI"],
+            ...(authRegistry?.accounts.filter((account) => account.provider_id).map((account) => [account.provider_id!, account.alias || account.provider_id!]) ?? []),
+          ])}
+          onRestored={() => void refreshSnapshot()}
+          onBusyChange={setIsHistoryBusy}
+        />
       ) : null}
 
       {isConnected ? (

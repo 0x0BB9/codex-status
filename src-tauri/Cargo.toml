@@ -1,9 +1,18 @@
 [package]
 name = "codex-status-floater"
-version = "0.1.16"
+version = "0.1.19"
 description = "A floating Codex status board for rate limits, threads, and local account switching."
 authors = ["Codex Status Floater contributors"]
 edition = "2021"
+default-run = "codex-status-floater"
+
+[[bin]]
+name = "codex-history-bridge"
+path = "src/history_bridge_main.rs"
+required-features = ["history-bridge-prototype"]
+
+[features]
+history-bridge-prototype = []
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

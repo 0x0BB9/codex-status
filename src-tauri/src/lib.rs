@@ -22,6 +22,13 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::ShortcutState;
 use toml_edit::{value, DocumentMut, Item, Table};
+mod history_bridge;
+
+pub fn run_history_bridge_if_requested() -> Option<Result<i32, Box<dyn std::error::Error>>> {
+    std::env::var_os("STATUS_FLOATER_UPSTREAM_CODEX").map(|upstream| {
+        history_bridge::run_upstream(upstream, std::env::args_os().skip(1).collect())
+    })
+}
 
 const MAIN_WINDOW_LABEL: &str = "main";
 #[cfg(target_os = "macos")]
@@ -207,6 +214,107 @@ fn floater_state_dir() -> Result<PathBuf, String> {
 
 fn thread_board_path() -> Result<PathBuf, String> {
     Ok(floater_state_dir()?.join("thread-board.json"))
+}
+
+fn validate_history_id(id: &str) -> Result<(), String> {
+    if id.is_empty() || id.len() > 128 || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err("任务 ID 格式无效。".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn export_thread_history(thread_id: String, content: String) -> Result<String, String> {
+    validate_history_id(&thread_id)?;
+    serde_json::from_str::<Value>(&content).map_err(|_| "导出内容不是有效 JSON。".to_string())?;
+    let path = floater_state_dir()?
+        .join("history-exports")
+        .join(format!("{thread_id}-{}.json", now_unix_millis()));
+    write_private_file(&path, content.as_bytes())?;
+    Ok(path.display().to_string())
+}
+
+#[derive(Deserialize, Serialize)]
+struct HistoryBackupEntry {
+    id: String,
+    path: Option<String>,
+    provider: String,
+    archived: bool,
+}
+
+#[derive(Serialize)]
+struct HistoryBackupResult {
+    directory: String,
+    copied: usize,
+    skipped: Vec<String>,
+}
+
+fn history_source_path(home: &Path, path: &Path) -> Result<PathBuf, String> {
+    let source = fs::canonicalize(path).map_err(|_| "聊天文件不存在或无法读取。".to_string())?;
+    let allowed = ["sessions", "archived_sessions"]
+        .iter()
+        .any(|name| fs::canonicalize(home.join(name)).is_ok_and(|root| source.starts_with(root)));
+    if !allowed || source.extension().and_then(|s| s.to_str()) != Some("jsonl") || !source.is_file()
+    {
+        return Err(
+            "聊天备份仅支持 Codex sessions / archived_sessions 内的 JSONL 文件。".to_string(),
+        );
+    }
+    Ok(source)
+}
+
+fn backup_thread_history_at_home(
+    home: &Path,
+    entries: &[HistoryBackupEntry],
+) -> Result<HistoryBackupResult, String> {
+    let directory = home.join("status-floater/history-backups");
+    let mut copied = 0;
+    let mut skipped = Vec::new();
+    for entry in entries {
+        validate_history_id(&entry.id)?;
+        let Some(path) = entry.path.as_deref() else {
+            skipped.push(entry.id.clone());
+            continue;
+        };
+        // An old index may outlive its rollout; keep the index and back up the remaining files.
+        let content = match history_source_path(home, Path::new(path)).and_then(|source| {
+            fs::read(source).map_err(|error| format!("读取聊天备份失败：{error}"))
+        }) {
+            Ok(content) => content,
+            Err(_) => {
+                skipped.push(entry.id.clone());
+                continue;
+            }
+        };
+        let initial = directory.join(format!("{}.initial.jsonl", entry.id));
+        if !initial.exists() {
+            write_private_file(&initial, &content)?;
+        }
+        let latest = directory.join(format!("{}.latest.jsonl", entry.id));
+        if fs::read(&latest).ok().as_deref() != Some(content.as_slice()) {
+            write_private_file(&latest, &content)?;
+        }
+        copied += 1;
+    }
+    write_json_file(&directory.join("last-switch.json"), &entries)?;
+    write_json_file(&directory.join("last-skipped.json"), &skipped)?;
+    Ok(HistoryBackupResult {
+        directory: directory.display().to_string(),
+        copied,
+        skipped,
+    })
+}
+
+#[tauri::command]
+async fn backup_thread_history(
+    entries: Vec<HistoryBackupEntry>,
+) -> Result<HistoryBackupResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        backup_thread_history_at_home(&codex_home()?, &entries)
+    })
+    .await
+    .map_err(|error| format!("聊天备份任务失败：{error}"))?
 }
 
 fn chatgpt_config_snapshot_path() -> Result<PathBuf, String> {
@@ -766,6 +874,93 @@ fn configure_api_provider(
     providers.insert(provider_id, Item::Table(provider));
 
     Ok(document.to_string())
+}
+
+fn retain_saved_provider_definitions(
+    content: &str,
+    registry: &StoredCodexRegistry,
+) -> Result<String, String> {
+    let mut document = content
+        .parse::<DocumentMut>()
+        .map_err(|error| format!("Invalid Codex config TOML: {error}"))?;
+    for account in registry
+        .accounts
+        .iter()
+        .filter(|account| is_api_connection(account))
+    {
+        let Some(provider_id) = account
+            .provider_id
+            .as_deref()
+            .filter(|id| id.starts_with(API_PROVIDER_PREFIX))
+        else {
+            continue;
+        };
+        let Some(base_url) = account.base_url.as_deref() else {
+            continue;
+        };
+        if !document.contains_key("model_providers") {
+            document["model_providers"] = Item::Table(Table::new());
+        }
+        let providers = document["model_providers"]
+            .as_table_mut()
+            .ok_or("model_providers 不是有效表。")?;
+        if !providers.contains_key(provider_id) {
+            let mut provider = Table::new();
+            provider["name"] = value(account.alias.as_deref().unwrap_or("Saved API connection"));
+            provider["base_url"] = value(base_url);
+            provider["wire_api"] = value("responses");
+            provider["requires_openai_auth"] = value(false);
+            providers.insert(provider_id, Item::Table(provider));
+        }
+    }
+    Ok(document.to_string())
+}
+
+fn write_history_route(content: &str, connection_key: Option<&str>) -> Result<(), String> {
+    let document = content
+        .parse::<DocumentMut>()
+        .map_err(|error| format!("Invalid Codex config TOML: {error}"))?;
+    let model = document
+        .get("model")
+        .and_then(Item::as_str)
+        .ok_or("当前配置未指定模型，无法启用跟随当前连接。")?;
+    let provider = document
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .unwrap_or("openai");
+    write_json_file(
+        &floater_state_dir()?.join("active-history-route.json"),
+        &serde_json::json!({"model": model, "modelProvider": provider, "connectionKey": connection_key}),
+    )
+}
+
+#[tauri::command]
+fn ensure_history_provider_definitions() -> Result<bool, String> {
+    let path = codex_config_path()?;
+    if !path.exists() {
+        return Ok(false);
+    }
+    let original =
+        fs::read_to_string(&path).map_err(|error| format!("读取 Codex 配置失败：{error}"))?;
+    let content = retain_saved_provider_definitions(&original, &read_registry()?)?;
+    let changed = content != original;
+    if changed {
+        write_private_file(
+            &floater_state_dir()?.join("config-before-provider-repair.toml"),
+            redact_api_provider_secrets(&original)?.as_bytes(),
+        )?;
+        write_private_file(&path, content.as_bytes())?;
+    }
+    // Route creation is required only when launching the compatibility bridge.
+    if content
+        .parse::<DocumentMut>()
+        .ok()
+        .and_then(|doc| doc.get("model").and_then(Item::as_str).map(str::to_owned))
+        .is_some()
+    {
+        write_history_route(&content, read_registry()?.active_account_key.as_deref())?;
+    }
+    Ok(changed)
 }
 
 fn redact_api_provider_secrets(existing_content: &str) -> Result<String, String> {
@@ -1614,6 +1809,8 @@ fn switch_local_codex_account(account_key: String) -> Result<AccountSwitchResult
     let config_path = codex_config_path()?;
     let previous_auth = fs::read(&auth_path).ok();
     let previous_config = fs::read(&config_path).ok();
+    let route_path = floater_state_dir()?.join("active-history-route.json");
+    let previous_route = fs::read(&route_path).ok();
     let backup_path = backup_connection_state(current_is_api)?;
     let target_catalog_path = is_api_connection(&target_account)
         .then(|| api_model_catalog_path(&target_account))
@@ -1638,7 +1835,10 @@ fn switch_local_codex_account(account_key: String) -> Result<AccountSwitchResult
         let baseline = fs::read_to_string(&baseline_path)
             .map_err(|_| "找不到 ChatGPT 配置快照，已停止切换。".to_string())?;
         let catalog_path = write_api_model_catalog(&target_account)?;
-        let config = configure_api_provider(&baseline, &target_account, &catalog_path, &api_key)?;
+        let config = retain_saved_provider_definitions(
+            &configure_api_provider(&baseline, &target_account, &catalog_path, &api_key)?,
+            &registry,
+        )?;
         let auth = chatgpt_auth_for_api_switch(&registry, previous_auth.as_deref())?;
         (auth, config.into_bytes())
     } else {
@@ -1657,14 +1857,20 @@ fn switch_local_codex_account(account_key: String) -> Result<AccountSwitchResult
         } else {
             previous_config.clone().unwrap_or_default()
         };
-        (auth, config)
+        let config =
+            retain_saved_provider_definitions(&String::from_utf8_lossy(&config), &registry)?;
+        (auth, config.into_bytes())
     };
 
     if let Err(error) = write_private_file(&config_path, &next_config)
         .and_then(|_| write_private_file(&auth_path, &next_auth))
+        .and_then(|_| {
+            write_history_route(&String::from_utf8_lossy(&next_config), Some(&account_key))
+        })
     {
         let _ = restore_file(&config_path, previous_config.as_deref());
         let _ = restore_file(&auth_path, previous_auth.as_deref());
+        let _ = restore_file(&route_path, previous_route.as_deref());
         if let Some(catalog_path) = target_catalog_path.as_deref() {
             let _ = restore_file(catalog_path, previous_target_catalog.as_deref());
         }
@@ -1677,6 +1883,7 @@ fn switch_local_codex_account(account_key: String) -> Result<AccountSwitchResult
     if let Err(error) = write_registry(&registry) {
         let config_rollback = restore_file(&config_path, previous_config.as_deref()).err();
         let auth_rollback = restore_file(&auth_path, previous_auth.as_deref()).err();
+        let _ = restore_file(&route_path, previous_route.as_deref());
         let catalog_rollback = target_catalog_path.as_deref().and_then(|catalog_path| {
             restore_file(catalog_path, previous_target_catalog.as_deref()).err()
         });
@@ -1707,6 +1914,81 @@ fn switch_local_codex_account(account_key: String) -> Result<AccountSwitchResult
 #[tauri::command]
 fn restart_codex_desktop_client() -> Result<(), String> {
     restart_codex_desktop_client_for_platform()
+}
+
+#[tauri::command]
+fn read_desktop_bridge_status() -> Result<Option<serde_json::Value>, String> {
+    let path = floater_state_dir()?.join("desktop-bridge-status.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let content =
+        fs::read_to_string(&path).map_err(|error| format!("读取 Codex 客户端状态失败：{error}"))?;
+    serde_json::from_str(&content)
+        .map(Some)
+        .map_err(|error| format!("解析 Codex 客户端状态失败：{error}"))
+}
+
+struct DesktopHistoryBridge {
+    executable: PathBuf,
+    route: PathBuf,
+    acknowledgement: PathBuf,
+    status: PathBuf,
+}
+
+fn prepare_desktop_history_bridge() -> Result<Option<DesktopHistoryBridge>, String> {
+    if !read_registry()?.accounts.iter().any(is_api_connection) {
+        return Ok(None);
+    }
+    ensure_history_provider_definitions()?;
+    write_history_route(
+        &fs::read_to_string(codex_config_path()?)
+            .map_err(|error| format!("读取当前模型配置失败：{error}"))?,
+        read_registry()?.active_account_key.as_deref(),
+    )?;
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let metadata = fs::metadata(&executable).map_err(|error| error.to_string())?;
+    let identity = stable_hash(&format!(
+        "{}:{}:{:?}",
+        env!("CARGO_PKG_VERSION"),
+        metadata.len(),
+        metadata.modified().ok()
+    ));
+    let directory = floater_state_dir()?.join("runtime-bridges").join(identity);
+    ensure_private_directory(&directory)?;
+    let target = directory.join(if cfg!(windows) {
+        "codex-history-bridge.exe"
+    } else {
+        "codex-history-bridge"
+    });
+    if !target.exists() {
+        let temporary = directory.join(format!("bridge-{}.tmp", now_unix_millis()));
+        fs::copy(executable, &temporary)
+            .map_err(|error| format!("准备历史兼容程序失败：{error}"))?;
+        #[cfg(unix)]
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+        fs::rename(temporary, &target).map_err(|error| error.to_string())?;
+    }
+    let status = floater_state_dir()?.join("desktop-bridge-status.json");
+    let _ = fs::remove_file(&status);
+    Ok(Some(DesktopHistoryBridge {
+        executable: target,
+        route: floater_state_dir()?.join("active-history-route.json"),
+        acknowledgement: directory.join(format!("activation-{}.json", now_unix_millis())),
+        status,
+    }))
+}
+
+fn verify_desktop_history_bridge(bridge: Option<&DesktopHistoryBridge>) -> Result<(), String> {
+    let Some(bridge) = bridge else { return Ok(()) };
+    for _ in 0..40 {
+        if bridge.acknowledgement.is_file() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    Err("客户端已启动，但未确认历史兼容连接生效，请勿在旧 API 任务中发送消息；可重新点击“立即重启 Codex 客户端”。".into())
 }
 
 #[cfg(target_os = "macos")]
@@ -1804,6 +2086,24 @@ fn terminate_macos_codex_desktop() {
 #[cfg(target_os = "macos")]
 fn restart_codex_desktop_client_for_platform() -> Result<(), String> {
     let app_path = running_macos_codex_app_path().or_else(installed_macos_codex_app_path);
+    let bridge = prepare_desktop_history_bridge()?;
+    let upstream = if bridge.is_some() {
+        app_path
+            .as_ref()
+            .and_then(|app| {
+                [
+                    "Contents/Resources/codex-cli/bin/codex",
+                    "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+                    "Contents/Resources/codex",
+                ]
+                .into_iter()
+                .map(|suffix| app.join(suffix))
+                .find(|path| path.is_file())
+            })
+            .ok_or("找不到官方客户端的原生运行时，已停止重启。")?
+    } else {
+        PathBuf::new()
+    };
     let was_running = macos_codex_desktop_running().unwrap_or(true);
 
     if was_running {
@@ -1828,6 +2128,23 @@ fn restart_codex_desktop_client_for_platform() -> Result<(), String> {
     }
 
     let mut open_command = Command::new("open");
+    if let Some(bridge) = &bridge {
+        for (key, value) in [
+            ("CODEX_CLI_PATH", bridge.executable.as_os_str()),
+            ("STATUS_FLOATER_UPSTREAM_CODEX", upstream.as_os_str()),
+            ("STATUS_FLOATER_HISTORY_ROUTE", bridge.route.as_os_str()),
+            (
+                "STATUS_FLOATER_BRIDGE_ACK",
+                bridge.acknowledgement.as_os_str(),
+            ),
+            ("STATUS_FLOATER_BRIDGE_STATUS", bridge.status.as_os_str()),
+        ] {
+            open_command
+                .arg("--env")
+                .arg(format!("{key}={}", value.to_string_lossy()));
+        }
+        open_command.args(["--env", "CODEX_APP_SERVER_FORCE_CLI=1"]);
+    }
     open_command.arg("-n");
     let launch_target = if let Some(path) = &app_path {
         open_command.arg(path);
@@ -1856,20 +2173,58 @@ fn restart_codex_desktop_client_for_platform() -> Result<(), String> {
         ));
     }
 
-    Ok(())
+    verify_desktop_history_bridge(bridge.as_ref())
 }
 
 #[cfg(target_os = "windows")]
 fn restart_codex_desktop_client_for_platform() -> Result<(), String> {
     const RESTART_SCRIPT: &str = r#"$app = Get-StartApps | Where-Object { $_.Name -in @('Codex', 'ChatGPT') } | Sort-Object { if ($_.Name -eq 'Codex') { 0 } else { 1 } } | Select-Object -First 1; if (-not $app) { Write-Error 'Unable to find Codex or ChatGPT in the Windows Start menu.'; exit 1 }; $processName = if ($app.Name -eq 'Codex') { 'Codex' } else { 'ChatGPT' }; Get-Process -Name $processName -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Milliseconds 1500; Start-Process explorer.exe "shell:AppsFolder\$($app.AppID)""#;
 
-    let status = Command::new("powershell.exe")
+    let bridge = prepare_desktop_history_bridge()?;
+    const BRIDGE_RESTART_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$app = Get-StartApps | Where-Object { $_.Name -in @('Codex','ChatGPT') } | Sort-Object { if ($_.Name -eq 'Codex') { 0 } else { 1 } } | Select-Object -First 1
+if (-not $app) { throw 'Cannot locate the official desktop app.' }
+$processName = if ($app.Name -eq 'Codex') { 'Codex' } else { 'ChatGPT' }
+$exe = Get-Process -Name $processName -ErrorAction SilentlyContinue | Where-Object { $_.Path } | Select-Object -First 1 -ExpandProperty Path
+if (-not $exe) {
+  $parts = $app.AppID -split '!'
+  $package = Get-AppxPackage | Where-Object { $_.PackageFamilyName -eq $parts[0] } | Select-Object -First 1
+  if ($package) {
+    $manifest = Get-AppxPackageManifest $package
+    $application = $manifest.Package.Applications.Application | Where-Object { $_.Id -eq $parts[1] } | Select-Object -First 1
+    if ($application) { $exe = Join-Path $package.InstallLocation $application.Executable }
+  }
+}
+if (-not $exe -or -not (Test-Path -LiteralPath $exe)) { throw 'Cannot resolve the app executable for history compatibility; original app was not stopped.' }
+$resources = Join-Path (Split-Path $exe) 'resources'
+$upstream = Get-ChildItem -LiteralPath $resources -Filter codex.exe -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+if (-not $upstream) { throw 'Cannot locate the original runtime; original app was not stopped.' }
+$env:STATUS_FLOATER_UPSTREAM_CODEX = $upstream
+$env:CODEX_APP_SERVER_FORCE_CLI = '1'
+Get-Process -Name $processName -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Milliseconds 1500
+Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe)
+"#;
+    let mut command = Command::new("powershell.exe");
+    if let Some(bridge) = &bridge {
+        command
+            .env("CODEX_CLI_PATH", &bridge.executable)
+            .env("STATUS_FLOATER_HISTORY_ROUTE", &bridge.route)
+            .env("STATUS_FLOATER_BRIDGE_ACK", &bridge.acknowledgement)
+            .env("STATUS_FLOATER_BRIDGE_STATUS", &bridge.status);
+    }
+    let status = command
         .args([
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            RESTART_SCRIPT,
+            if bridge.is_some() {
+                BRIDGE_RESTART_SCRIPT
+            } else {
+                RESTART_SCRIPT
+            },
         ])
         .status()
         .map_err(|error| format!("Unable to restart Codex desktop client: {error}"))?;
@@ -1878,7 +2233,7 @@ fn restart_codex_desktop_client_for_platform() -> Result<(), String> {
         return Err("Unable to restart the Codex desktop client on Windows.".to_string());
     }
 
-    Ok(())
+    verify_desktop_history_bridge(bridge.as_ref())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -1948,6 +2303,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_local_codex_accounts,
+            ensure_history_provider_definitions,
             mark_local_codex_account_invalid,
             clear_local_codex_account_invalid,
             delete_local_codex_account,
@@ -1957,8 +2313,11 @@ pub fn run() {
             save_current_codex_account,
             switch_local_codex_account,
             restart_codex_desktop_client,
+            read_desktop_bridge_status,
             read_codex_reset_credits,
             list_thread_board_metadata,
+            export_thread_history,
+            backup_thread_history,
             set_thread_board_metadata
         ])
         .run(tauri::generate_context!())
@@ -1967,6 +2326,89 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missing_old_rollouts_do_not_block_other_backups() {
+        use super::{backup_thread_history_at_home, HistoryBackupEntry};
+        use std::fs;
+        let home = std::env::temp_dir().join(format!(
+            "floater-partial-backup-test-{}-{}",
+            std::process::id(),
+            super::now_unix_millis()
+        ));
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        let source = home.join("sessions/present.jsonl");
+        fs::write(&source, "{\"message\":\"first\"}\n").unwrap();
+        let entries = vec![
+            HistoryBackupEntry {
+                id: "missing-old".into(),
+                path: Some(
+                    home.join("archived_sessions/missing.jsonl")
+                        .display()
+                        .to_string(),
+                ),
+                provider: "test".into(),
+                archived: true,
+            },
+            HistoryBackupEntry {
+                id: "present".into(),
+                path: Some(source.display().to_string()),
+                provider: "test".into(),
+                archived: false,
+            },
+        ];
+        let result = backup_thread_history_at_home(&home, &entries).unwrap();
+        assert_eq!(result.copied, 1);
+        assert_eq!(result.skipped, vec!["missing-old"]);
+        let directory = home.join("status-floater/history-backups");
+        assert!(directory.join("last-switch.json").exists());
+        assert!(directory.join("last-skipped.json").exists());
+        let first = fs::read(directory.join("present.initial.jsonl")).unwrap();
+        fs::write(source, "{\"message\":\"new\"}\n").unwrap();
+        backup_thread_history_at_home(&home, &entries).unwrap();
+        assert_eq!(
+            fs::read(directory.join("present.initial.jsonl")).unwrap(),
+            first
+        );
+        assert_ne!(
+            fs::read(directory.join("present.latest.jsonl")).unwrap(),
+            first
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn history_paths_reject_credentials_and_traversal() {
+        use super::{history_source_path, validate_history_id};
+        use std::fs;
+        let home = std::env::temp_dir().join(format!(
+            "floater-history-test-{}-{}",
+            std::process::id(),
+            super::now_unix_millis()
+        ));
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        fs::create_dir_all(home.join("archived_sessions")).unwrap();
+        fs::write(home.join("sessions/test.jsonl"), "{}\n").unwrap();
+        fs::write(home.join("archived_sessions/test.jsonl"), "{}\n").unwrap();
+        fs::write(home.join("auth.json"), "{}").unwrap();
+        fs::write(home.join("outside.jsonl"), "{}\n").unwrap();
+        assert!(history_source_path(&home, &home.join("sessions/test.jsonl")).is_ok());
+        assert!(history_source_path(&home, &home.join("archived_sessions/test.jsonl")).is_ok());
+        assert!(history_source_path(&home, &home.join("auth.json")).is_err());
+        assert!(history_source_path(&home, &home.join("sessions/../outside.jsonl")).is_err());
+        assert!(validate_history_id("../auth").is_err());
+        assert!(validate_history_id("task-123").is_ok());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                home.join("outside.jsonl"),
+                home.join("sessions/link.jsonl"),
+            )
+            .unwrap();
+            assert!(history_source_path(&home, &home.join("sessions/link.jsonl")).is_err());
+        }
+        fs::remove_dir_all(home).unwrap();
+    }
+
     #[cfg(target_os = "macos")]
     use super::macos_app_bundle_from_executable;
     use super::{
@@ -2040,6 +2482,38 @@ mod tests {
         let redacted = redact_api_provider_secrets(&configured).expect("config should redact");
         assert!(!redacted.contains("test-bearer-token"));
         assert!(!redacted.contains("experimental_bearer_token"));
+    }
+
+    #[test]
+    fn restores_old_provider_definitions_without_changing_current_model_or_copying_keys() {
+        let registry = StoredCodexRegistry {
+            accounts: vec![StoredCodexAccount {
+                account_key: "api-profile::fixture".into(),
+                connection_kind: Some("api".into()),
+                provider_id: Some("status_floater_api_fixture".into()),
+                base_url: Some("https://example.com/v1".into()),
+                ..StoredCodexAccount::default()
+            }],
+            ..StoredCodexRegistry::default()
+        };
+        let original = "model = \"gpt-5\"\n[model_providers.other]\nname = \"Existing\"\n";
+        let updated = super::retain_saved_provider_definitions(original, &registry).unwrap();
+        let document = updated.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(document["model"].as_str(), Some("gpt-5"));
+        assert!(!document.contains_key("model_provider"));
+        assert_eq!(
+            document["model_providers"]["other"]["name"].as_str(),
+            Some("Existing")
+        );
+        assert_eq!(
+            document["model_providers"]["status_floater_api_fixture"]["wire_api"].as_str(),
+            Some("responses")
+        );
+        assert!(!updated.contains("experimental_bearer_token"));
+        assert_eq!(
+            super::retain_saved_provider_definitions(&updated, &registry).unwrap(),
+            updated
+        );
     }
 
     #[test]

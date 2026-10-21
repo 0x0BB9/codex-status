@@ -58,8 +58,23 @@ export type ApiConnectionTestResult = {
   modelFound: boolean;
 };
 
+export type DesktopBridgeStatus = {
+  state: "preparing" | "working" | "retrying" | "failed" | "completed";
+  message: string;
+  threadId?: string | null;
+  turnId?: string | null;
+  codexErrorInfo?: unknown;
+  willRetry?: boolean | null;
+  retryCount?: number | null;
+  updatedAtMs: number;
+};
+
 export async function listLocalCodexAccounts() {
   return invoke<StoredCodexRegistry>("list_local_codex_accounts");
+}
+
+export async function ensureHistoryProviderDefinitions() {
+  return invoke<boolean>("ensure_history_provider_definitions");
 }
 
 export async function ensureFileAuthCredentialsStore() {
@@ -102,6 +117,10 @@ export async function deleteLocalCodexAccount(accountKey: string) {
 
 export async function restartCodexDesktopClient() {
   return invoke<void>("restart_codex_desktop_client");
+}
+
+export async function readDesktopBridgeStatus() {
+  return invoke<DesktopBridgeStatus | null>("read_desktop_bridge_status");
 }
 
 export async function saveApiConnectionProfile(params: SaveApiConnectionParams) {

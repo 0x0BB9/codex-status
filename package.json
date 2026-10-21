@@ -1,11 +1,12 @@
 {
   "name": "codex-status-floater",
   "private": true,
-  "version": "0.1.16",
+  "version": "0.1.19",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test:history": "node --test tests/thread-history.test.mjs",
     "prepare:codex-sidecar": "node scripts/prepare-codex-sidecar.mjs",
     "preview": "vite preview",
     "protocol:generate": "codex app-server generate-ts --out src/generated",
@@ -16,7 +17,7 @@
     "tauri:dev": "tauri dev",
     "windows:build": "tauri build --bundles nsis,msi",
     "mac:sign:adhoc": "codesign --force --deep --sign - 'src-tauri/target/release/bundle/macos/Codex Status Floater.app'",
-    "mac:dmg:adhoc": "mkdir -p 'src-tauri/target/release/bundle/dmg' && hdiutil create -volname 'Codex Status Floater' -srcfolder 'src-tauri/target/release/bundle/macos/Codex Status Floater.app' -ov -format UDZO 'src-tauri/target/release/bundle/dmg/Codex Status Floater_0.1.16_aarch64_adhoc.dmg'",
+    "mac:dmg:adhoc": "mkdir -p 'src-tauri/target/release/bundle/dmg' && hdiutil create -volname 'Codex Status Floater' -srcfolder 'src-tauri/target/release/bundle/macos/Codex Status Floater.app' -ov -format UDZO 'src-tauri/target/release/bundle/dmg/Codex Status Floater_0.1.19_aarch64_adhoc.dmg'",
     "mac:package:adhoc": "pnpm tauri:build && pnpm mac:sign:adhoc && pnpm mac:dmg:adhoc"
   },
   "dependencies": {

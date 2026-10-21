@@ -39,9 +39,13 @@ The app implements local account switching itself. It does not require `codex-au
 - Failed verification automatically restores the previous account instead of leaving Codex signed out.
 - Failed target accounts are marked for re-login. A successful official login clears the marker, while inactive accounts can be deleted after confirmation.
 - API keys are stored long-term in macOS Keychain or Windows Credential Manager; the registry stores only a last-four-character hint.
-- Activating an API connection preserves the Plus login, switches the model provider and generated model catalog, then opens a separate thread bound to that provider. Switching back restores the original Codex configuration.
+- Activating an API connection preserves the Plus login and switches the provider and model catalog. Switching back restores the GPT configuration while retaining key-free definitions required by older chats.
+- Restart the official client from this tool to enable the native compatibility bridge. It queries all providers by default and resumes old chats with the active connection and configured model, without migrating stored history. A changed connection requires another restart before sending messages.
+- On first cross-provider resume, the original rollout is backed up and only visible user/assistant messages are replayed. Provider-private reasoning, function calls, tool outputs, and web-search items are excluded; the thread ID remains intact. Backups stay under `CODEX_HOME/status-floater/history-compat-backups/`.
+- While the compatibility bridge is active, the floater shows the desktop task's working, retrying, failed, and completed states, including retry progress for overloaded services.
 - While an API connection is active, its key is copied only into the user-readable provider configuration; connection backups redact that bearer token.
-- The app compares the all-provider unarchived thread count before and after switching, and restores the previous connection if the count drops.
+- History protection runs during account switching. An issue reveals a recovery entry for cross-provider records, message viewing, JSON export, and confirmed unarchiving; there is no permanent history panel.
+- Before switching, the app backs up readable local conversation files. It checks thread IDs, provider bindings, and newly archived records after switching and again after a successful desktop restart, reporting history issues separately from authentication failures.
 - The account panel can restart the official Codex desktop client on macOS or Windows after a verified switch. Newer ChatGPT desktop builds may keep a separate host session that still needs confirmation inside the official client.
 
 See [docs/account-switching.md](docs/account-switching.md) for the full file layout, switching flow, backups, compatibility notes, and limitations.
